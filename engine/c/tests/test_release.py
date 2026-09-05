@@ -22,6 +22,17 @@ class ReleaseTests(unittest.TestCase):
             'from colibri import __version__; print(__version__)'], env=env, text=True).strip()
         self.assertEqual(package, version)
 
+    def test_installer_scripts_parse_and_help(self):
+        for name in ('install.sh', 'engine/c/install_models.sh', 'engine/c/install_llamacpp.sh',
+                     'engine/c/install_vllm.sh', 'engine/c/write_env.sh'):
+            subprocess.run(['bash', '-n', str(ROOT / name)], check=True)
+            self.assertTrue(os.access(ROOT / name, os.X_OK), name)
+        result = subprocess.run(['bash', str(ROOT / 'install.sh'), '--help'], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0)
+        for flag in ('--check', '--no-apt', '--core-only', '--skip-models', '--skip-llamacpp',
+                     '--skip-vllm', '--systemd', '--data-dir'):
+            self.assertIn(flag, result.stdout)
+
     def test_installer_preflight(self):
         script = (ROOT / 'install.sh').read_text()
         subprocess.run(['bash', '-n', str(ROOT / 'install.sh')], check=True)
@@ -52,6 +63,11 @@ class ReleaseTests(unittest.TestCase):
                 self.assertEqual(result.returncode, code, result.stdout + result.stderr)
                 self.assertIn(fragment, result.stdout + result.stderr)
             check(0, 'CUDA: 12.4')
+            check(0, 'Data directory')
+            result = subprocess.run(['bash', str(test_script), '--check', '--core-only', '--data-dir', tmp],
+                                    env=env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('about 5 GB needed', result.stdout)
             (base / 'meminfo').write_text('MemTotal: 64000000 kB\n')
             check(1, '128 GB')
             (base / 'meminfo').write_text('MemTotal: 131000000 kB\n')
