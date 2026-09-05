@@ -1,0 +1,11 @@
+*.gguf
+*.safetensors
+models/
+.DS_Store
+engine/c/test_ggml_blocks
+engine/c/test_ggml_blocks_cuda
+*.o
+__pycache__/
+
+.venv/
+.release/

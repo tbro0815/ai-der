@@ -1,0 +1,1 @@
+Vendored from https://github.com/JustVugg/colibri @ 184e05221a43b3bbeb3321e3438c067b3a46e202 (2026-08-30, v1.9.x line, Apache-2.0)
