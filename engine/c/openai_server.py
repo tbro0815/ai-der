@@ -23,6 +23,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 
 import v4_dsml                      # vendored DeepSeek V4 DSML reference primitives
@@ -2854,6 +2856,62 @@ def responses_tools(body):
         raise APIError(400, "`tool_choice` must be auto, none, required or {type: function, name}.",
                        "tool_choice", "invalid_value")
     return (tools or None), tool_choice, skipped, namespaces
+
+
+# ---- dashboard tool: web search through Serper -------------------------------------------
+# The dashboard declares one function tool, `web_search`, when the user has entered a Serper
+# API key (kept in the browser's localStorage, never on this server). The browser cannot call
+# Serper directly (CORS), so it posts the model's arguments and its key here; the gateway
+# performs the outbound request and returns a compact result list. The key rides in the
+# request body per call and is not logged or persisted.
+SERPER_URL = "https://google.serper.dev/search"
+
+
+def web_search_tool(body, opener=None):
+    if not isinstance(body, dict):
+        raise APIError(400, "Request body must be an object.")
+    key = body.get("api_key")
+    if not isinstance(key, str) or not 8 <= len(key) <= 128 or any(c.isspace() for c in key):
+        raise APIError(400, "`api_key` (a Serper API key) is required.", "api_key")
+    query = body.get("query")
+    if not isinstance(query, str) or not query.strip() or len(query) > 400:
+        raise APIError(400, "`query` must be a non-empty string of at most 400 characters.", "query")
+    num = body.get("num", 5)
+    if isinstance(num, bool) or not isinstance(num, int) or not 1 <= num <= 10:
+        raise APIError(400, "`num` must be an integer between 1 and 10.", "num")
+    payload = {"q": query.strip(), "num": num}
+    for option in ("gl", "hl"):
+        value = body.get(option)
+        if isinstance(value, str) and 2 <= len(value) <= 5 and value.isalpha():
+            payload[option] = value.lower()
+    request = urllib.request.Request(SERPER_URL, data=json.dumps(payload).encode("utf-8"),
+                                     headers={"X-API-KEY": key, "Content-Type": "application/json"},
+                                     method="POST")
+    opener = opener or urllib.request.urlopen
+    try:
+        with opener(request, timeout=20) as reply:
+            data = json.loads(reply.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        if error.code in (401, 403):
+            raise APIError(400, "Serper rejected the API key.", "api_key", "invalid_api_key")
+        raise APIError(502, f"Serper answered HTTP {error.code}.", None, "upstream_error", "server_error")
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as error:
+        raise APIError(502, f"Serper is not reachable: {str(error)[:120]}", None, "upstream_error",
+                       "server_error")
+    results = []
+    for item in (data.get("organic") or [])[:num]:
+        if not isinstance(item, dict):
+            continue
+        results.append({k: item.get(k) for k in ("title", "link", "snippet", "date") if item.get(k)})
+    out = {"provider": "serper", "query": payload["q"], "results": results}
+    box = data.get("answerBox")
+    if isinstance(box, dict):
+        out["answer"] = {k: box.get(k) for k in ("title", "answer", "snippet", "link") if box.get(k)}
+    graph = data.get("knowledgeGraph")
+    if isinstance(graph, dict):
+        out["knowledge_graph"] = {k: graph.get(k) for k in ("title", "type", "description", "website")
+                                  if graph.get(k)}
+    return out
 
 
 def conversation_cache_slot(messages, kv_slots):
@@ -5709,6 +5767,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 timer.start()
                 return
             body = self.read_json()
+            if path == "/v1/tools/web_search":
+                self.send_json(200, web_search_tool(body), request_id, {"Cache-Control": "no-store"})
+                return
             self.check_model(body)
             if path == "/v1/chat/completions":
                 self.chat_completion(body, request_id)

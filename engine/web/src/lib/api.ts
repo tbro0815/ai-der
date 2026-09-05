@@ -1,4 +1,11 @@
-export type ChatRole = "system" | "user" | "assistant"
+export type ChatRole = "system" | "user" | "assistant" | "tool"
+
+/** A function call the model made; `arguments` is the raw JSON string. */
+export interface ToolCall {
+  id: string
+  name: string
+  arguments: string
+}
 
 export interface ChatMessage {
   id: string
@@ -13,6 +20,11 @@ export interface ChatMessage {
      the answer. Kept apart from `content` so it can be rendered separately
      and included in later prompts only when preserve_thinking is enabled. */
   reasoning?: string
+  /* tool use (dashboard web_search): calls the assistant made, and on a
+     `tool` message the call it answers */
+  toolCalls?: ToolCall[]
+  toolCallId?: string
+  toolName?: string
 }
 
 export function withSystemPrompt(messages: ChatMessage[], prompt: string, enabled: boolean) {
@@ -234,6 +246,7 @@ export interface TokenUsage {
 
 export interface StreamChatResult {
   finishReason: string | null
+  toolCalls: ToolCall[]
   usage: TokenUsage | null
   requestId: string | null
   queueWaitMs: number | null
@@ -409,6 +422,8 @@ export interface StreamChatOptions {
   signal: AbortSignal
   onDelta: (text: string) => void
   onReasoning?: (text: string) => void
+  /** OpenAI function tools declared with the request (dashboard web_search) */
+  tools?: readonly unknown[]
 }
 
 export async function streamChat(options: StreamChatOptions): Promise<StreamChatResult> {
@@ -420,7 +435,7 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
       model: options.model,
       /* Un turno con immagini viaggia nella forma a parti dell'API OpenAI;
          senza, resta la stringa di sempre e nessun server vede una differenza. */
-      messages: options.messages.map(({ role, content, images, reasoning }) => ({
+      messages: options.messages.map(({ role, content, images, reasoning, toolCalls, toolCallId }) => ({
         role,
         content: images && images.length
           ? [
@@ -431,7 +446,12 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
         ...(options.preserveThinking && role === "assistant" && reasoning
           ? { reasoning_content: reasoning }
           : {}),
+        ...(role === "assistant" && toolCalls && toolCalls.length
+          ? { tool_calls: toolCalls.map((call) => ({ id: call.id, type: "function", function: { name: call.name, arguments: call.arguments } })) }
+          : {}),
+        ...(role === "tool" ? { tool_call_id: toolCallId } : {}),
       })),
+      ...(options.tools && options.tools.length ? { tools: [...options.tools], tool_choice: "auto" } : {}),
       temperature: options.temperature,
       max_completion_tokens: options.maxTokens,
       enable_thinking: options.enableThinking,
@@ -453,11 +473,13 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
   let buffer = ""
   let finishReason: string | null = null
   let usage: TokenUsage | null = null
+  const toolCalls = new Map<number, ToolCall>()
 
   const consume = (data: string) => {
     if (data === "[DONE]") return
     const event = JSON.parse(data) as {
-      choices?: Array<{ delta?: { content?: string; reasoning_content?: string }; finish_reason?: string | null }>
+      choices?: Array<{ delta?: { content?: string; reasoning_content?: string;
+        tool_calls?: Array<{ index?: number; id?: string; function?: { name?: string; arguments?: string } }> }; finish_reason?: string | null }>
       usage?: TokenUsage | null
     }
     const choice = event.choices?.[0]
@@ -465,6 +487,16 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
     if (text) options.onDelta(text)
     const reasoning = choice?.delta?.reasoning_content
     if (reasoning) options.onReasoning?.(reasoning)
+    for (const part of choice?.delta?.tool_calls ?? []) {
+      /* deltas may split one call over several chunks: merge by index */
+      const index = part.index ?? toolCalls.size
+      const current = toolCalls.get(index) ?? { id: "", name: "", arguments: "" }
+      toolCalls.set(index, {
+        id: part.id || current.id,
+        name: part.function?.name || current.name,
+        arguments: current.arguments + (part.function?.arguments ?? ""),
+      })
+    }
     if (choice?.finish_reason) finishReason = choice.finish_reason
     if (event.usage) usage = event.usage
   }
@@ -482,8 +514,21 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
   const parsedQueueWait = queueWaitHeader === null ? null : Number(queueWaitHeader)
   return {
     finishReason,
+    toolCalls: [...toolCalls.values()].filter((call) => call.name),
     usage,
     requestId: response.headers.get("x-request-id"),
     queueWaitMs: parsedQueueWait !== null && Number.isFinite(parsedQueueWait) ? parsedQueueWait : null,
   }
+}
+
+/** The dashboard's web_search tool, relayed by the gateway to Serper (the browser
+ *  cannot call Serper directly); the Serper key travels with each call only. */
+export async function webSearch(baseUrl: string, apiKey: string, serperKey: string, query: string, num = 5) {
+  const response = await fetch(endpoint(baseUrl, "tools/web_search"), {
+    method: "POST",
+    headers: headers(apiKey),
+    body: JSON.stringify({ api_key: serperKey, query, num: Math.min(10, Math.max(1, Math.round(num) || 5)) }),
+  })
+  if (!response.ok) throw new Error(await responseError(response))
+  return (await response.json()) as { query: string; results: Array<{ title?: string; link?: string; snippet?: string; date?: string }>; answer?: Record<string, string> }
 }

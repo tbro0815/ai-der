@@ -1,6 +1,8 @@
 const de: Record<string, string> = {
   // navigation
   "nav.chat": "Chat",
+  "nav.settings": "Einstellungen",
+  "nav.close": "Schließen",
   "nav.brain": "Expertenkarte",
   "nav.profiling": "Profiling",
 
@@ -10,6 +12,16 @@ const de: Record<string, string> = {
   "brand.tagline": "local giant, tiny footprint",
   // Seitenleiste – Verbindung
   "sidebar.connection": "Verbindung",
+  "sidebar.webSearch": "Websuche",
+  "sidebar.serperKey": "Serper-API-Schlüssel",
+  "sidebar.serperKeyPlaceholder": "von serper.dev",
+  "sidebar.serperKeyHelp": "Im lokalen Speicher dieses Browsers gesichert. Wird bei jeder Suche an diesen AI-DER-Endpunkt gesendet, der sie an Serper weiterreicht; auf dem Server nie gespeichert.",
+  "sidebar.webSearchToggle": "web_search dem Modell anbieten",
+  "sidebar.webSearchHelp": "Wird bei jeder Anfrage dieses Chats als Werkzeug deklariert, das Modell kann ab dem ersten Zug suchen. Ergebnisse kommen als Werkzeug-Nachrichten zurück.",
+  "chat.webSearch": "Websuche",
+  "chat.searching": "Suche: {{q}}",
+  "chat.searchResults": "{{q}} · {{n}} Treffer",
+  "chat.searchFailed": "Suche fehlgeschlagen",
   "sidebar.vllmProfile": "vLLM-Profil nach Neustart",
   "sidebar.vllmProfileHelp": "long: 131K Kontext, fp8-KV-Cache. fast: 64K Kontext, bf16-KV-Cache, etwa 40 % schnelleres Decoding. Gilt ab dem nächsten vLLM-Start.",
   "sidebar.vllmProfilePending": "Server neu starten, um das Profil zu übernehmen.",

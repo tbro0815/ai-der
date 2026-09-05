@@ -3563,3 +3563,48 @@ class BackendSelectionTest(unittest.TestCase):
                 self.assertEqual(second.settings_payload()["backend_next"], "llamacpp")
             finally:
                 second.scheduler.close(); second.server_close()
+
+
+class WebSearchToolTest(unittest.TestCase):
+    """The dashboard's web_search tool: the gateway relays the model's arguments to Serper."""
+
+    def test_maps_serper_results_and_validates_input(self):
+        import io
+        from openai_server import web_search_tool
+        seen = {}
+
+        class Reply(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def opener(request, timeout):
+            seen["url"] = request.full_url
+            seen["key"] = request.get_header("X-api-key")
+            seen["body"] = json.loads(request.data.decode())
+            return Reply(json.dumps({"organic": [
+                {"title": "A", "link": "https://a", "snippet": "sa", "date": "2026", "position": 1},
+                {"title": "B", "link": "https://b", "snippet": "sb"}],
+                "answerBox": {"title": "T", "answer": "42"},
+                "knowledgeGraph": {"title": "K", "type": "Thing", "description": "d"}}).encode())
+
+        out = web_search_tool({"api_key": "k" * 32, "query": "meaning of life", "num": 1, "gl": "de"}, opener)
+        self.assertEqual(seen["url"], "https://google.serper.dev/search")
+        self.assertEqual(seen["key"], "k" * 32)
+        self.assertEqual(seen["body"], {"q": "meaning of life", "num": 1, "gl": "de"})
+        self.assertEqual(out["results"], [{"title": "A", "link": "https://a", "snippet": "sa", "date": "2026"}])
+        self.assertEqual(out["answer"], {"title": "T", "answer": "42"})
+        self.assertEqual(out["knowledge_graph"]["type"], "Thing")
+        for bad in ({"query": "x"}, {"api_key": "short", "query": "x"},
+                    {"api_key": "k" * 32, "query": ""}, {"api_key": "k" * 32, "query": "x", "num": 50}):
+            with self.assertRaises(APIError):
+                web_search_tool(bad, opener)
+
+    def test_route_needs_no_model_and_reports_key_rejection(self):
+        from urllib.error import HTTPError
+        from openai_server import web_search_tool
+        def rejecting(request, timeout):
+            raise HTTPError(request.full_url, 403, "forbidden", {}, None)
+        with self.assertRaises(APIError) as caught:
+            web_search_tool({"api_key": "k" * 32, "query": "x"}, rejecting)
+        self.assertEqual(caught.exception.status, 400)
+        self.assertIn("rejected", caught.exception.message)

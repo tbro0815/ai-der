@@ -15,6 +15,9 @@ export interface PublicSettings {
   /** Qwen3.8 reasoning effort: low | medium | xhigh (model default xhigh) */
   reasoningEffort: string
   preserveThinking: boolean
+  /** dashboard web_search tool: Serper API key (stored here by the user's choice) and its switch */
+  serperApiKey: string
+  webSearch: boolean
   reasoningBudget: number
   speculativeDecoding: boolean
   gpuRouter: boolean
@@ -53,6 +56,8 @@ export function loadPublicSettings(
       // reset once (the V2 marker is written with every save from then on)
       preserveThinking: saved.preserveThinkingV2 === true && typeof saved.preserveThinking === "boolean"
         ? saved.preserveThinking : defaults.preserveThinking,
+      serperApiKey: typeof saved.serperApiKey === "string" ? saved.serperApiKey.trim() : defaults.serperApiKey,
+      webSearch: typeof saved.webSearch === "boolean" ? saved.webSearch : defaults.webSearch,
       reasoningBudget: Math.round(number(saved.reasoningBudget, defaults.reasoningBudget, 0, 32768)),
       speculativeDecoding: typeof saved.speculativeDecoding === "boolean" ? saved.speculativeDecoding : defaults.speculativeDecoding,
       gpuRouter: typeof saved.gpuRouter === "boolean" ? saved.gpuRouter : defaults.gpuRouter,

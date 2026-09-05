@@ -34,7 +34,9 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
-import { type PrefillProgress, getHealth, getServerSettings, listModels, resetCache, restartServer, streamChat, updateApiDefaults, updateServerBackend, updateVllmProfile, updateServerSettings, withSystemPrompt, type ChatMessage, type HealthResponse, type ServerSettings, type StreamChatResult } from "@/lib/api"
+import { pickSuggestions } from "@/prompts"
+import { WEB_SEARCH_TOOLS, parseWebSearchResult } from "@/tools"
+import { type PrefillProgress, getHealth, getServerSettings, listModels, resetCache, restartServer, streamChat, updateApiDefaults, updateServerBackend, updateVllmProfile, webSearch as webSearchCall, updateServerSettings, withSystemPrompt, type ChatMessage, type HealthResponse, type ServerSettings, type StreamChatResult } from "@/lib/api"
 import { activeRequests, decodeTokensPerSecond, supportsCacheSlots } from "@/lib/runtime"
 import { Brain } from "./Brain"
 import { Profiling } from "./Profiling"
@@ -80,6 +82,8 @@ export default function App() {
       thinking: false,
       reasoningEffort: "xhigh",
       preserveThinking: false,
+      serperApiKey: "",
+      webSearch: false,
       reasoningBudget: 8192,
       speculativeDecoding: true,
       gpuRouter: true,
@@ -109,6 +113,11 @@ export default function App() {
   const temperature = thinking ? temperatureThinking : temperatureInstruct
   const setTemperature = thinking ? setTemperatureThinking : setTemperatureInstruct
   const [preserveThinking, setPreserveThinking] = useState(initialSettings.preserveThinking)
+  const [serperApiKey, setSerperApiKey] = useState(initialSettings.serperApiKey)
+  const [webSearch, setWebSearch] = useState(initialSettings.webSearch)
+  /* the tool is declared on every request of a chat once a key is present, so the
+     model knows about it from the first turn */
+  const webSearchEnabled = webSearch && serperApiKey.trim().length >= 8
   const [reasoningBudget, setReasoningBudget] = useState(initialSettings.reasoningBudget)
   const [speculativeDecoding, setSpeculativeDecoding] = useState(initialSettings.speculativeDecoding)
   const [gpuRouter, setGpuRouter] = useState(initialSettings.gpuRouter)
@@ -220,6 +229,12 @@ export default function App() {
   }
   const [connected, setConnected] = useState(false)
   const [view, setView] = useState<"chat" | "brain" | "profiling" | "log">("chat")
+  /* phones: the sidebar is a drawer over the chat (CSS below 820px); desktop ignores this state */
+  const [sidebarOpen, setSidebarOpen] = useState(false)
+  useEffect(() => {
+    document.body.classList.toggle("sidebar-open", sidebarOpen)
+    return () => document.body.classList.remove("sidebar-open")
+  }, [sidebarOpen])
   /* The Profiling pane renders the engine's per-turn PROF phase lines, which
      the qwen38 engine does not emit (nor do the proxy backends); it stays in
      the tree for development and is hidden from users until it carries data. */
@@ -236,6 +251,10 @@ export default function App() {
   const probeRef = useRef<AbortController | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
   const messages = conversations[cacheSlot] || []
+  /* three suggestion cards, drawn afresh each time the conversation is empty */
+  const [suggestions, setSuggestions] = useState(() => pickSuggestions())
+  const conversationEmpty = messages.length === 0
+  useEffect(() => { if (conversationEmpty) setSuggestions(pickSuggestions()) }, [conversationEmpty])
   const kvSlots = Math.max(1, health?.kv_slots || 1)
   const active = activeRequests(health)
   const capacity = health?.scheduler?.capacity || kvSlots
@@ -252,10 +271,10 @@ export default function App() {
   // EFFECT #1
   useEffect(() => {
     persistPublicSettings(localStorage, {
-      baseUrl, model, temperatureThinking, temperatureInstruct, maxTokens, thinking, reasoningEffort, preserveThinking, reasoningBudget, cacheSlot, autoScroll,
+      baseUrl, model, temperatureThinking, temperatureInstruct, maxTokens, thinking, reasoningEffort, preserveThinking, serperApiKey, webSearch, reasoningBudget, cacheSlot, autoScroll,
       speculativeDecoding, gpuRouter, systemPrompt, useSystemPrompt, endpointSystemPrompt,
     })
-  }, [autoScroll, baseUrl, cacheSlot, endpointSystemPrompt, gpuRouter, maxTokens, model, preserveThinking, reasoningBudget, reasoningEffort, speculativeDecoding, systemPrompt, temperatureInstruct, temperatureThinking, thinking, useSystemPrompt])
+  }, [autoScroll, baseUrl, cacheSlot, endpointSystemPrompt, gpuRouter, maxTokens, model, preserveThinking, reasoningBudget, reasoningEffort, serperApiKey, speculativeDecoding, systemPrompt, temperatureInstruct, temperatureThinking, thinking, useSystemPrompt, webSearch])
 
   // EFFECT #2
   useEffect(() => {
@@ -428,13 +447,13 @@ export default function App() {
     if ((!content && !attachments.length) || loading) return
     const user = message("user", content)
     if (attachments.length) user.images = attachments.map((item) => item.url)
-    const assistant = message("assistant", "")
-    const history = [...messages, user]
+    let assistant = message("assistant", "")
+    let history = [...messages, user]
     /* a proxy backend cannot take the conversation's earlier images (it would
        answer 400 on every turn): send the text only and say so once per send */
     const imagesOmitted = !imagesSupported && history.some((item) => item.images && item.images.length)
-    const requestMessages = withSystemPrompt(
-      imagesOmitted ? history.map((item) => (item.images && item.images.length ? { ...item, images: undefined } : item)) : history,
+    const requestFor = (turns: ChatMessage[]) => withSystemPrompt(
+      imagesOmitted ? turns.map((item) => (item.images && item.images.length ? { ...item, images: undefined } : item)) : turns,
       systemPrompt, useSystemPrompt)
     setDraft("")
     setAttachments([])
@@ -460,48 +479,83 @@ export default function App() {
       const rate = decodeTokensPerSecond(count, firstTokenAt, now)
       if (rate !== null) setTokPerSec(rate)
     }
+    const usageTotal = { prompt: 0, completion: 0 }
     try {
-      const result = await streamChat({
-        baseUrl,
-        apiKey,
-        model,
-        messages: requestMessages,
-        temperature,
-        maxTokens,
-        enableThinking: thinking,
-        reasoningEffort,
-        preserveThinking,
-        reasoningBudget,
-        speculativeDecoding,
-        gpuRouter,
-        cacheSlot: supportsCacheSlots(health) ? cacheSlot : undefined,
-        signal: controller.signal,
-        /* Reasoning tokens are tokens: they count toward the rate, and the
-           first one is the real time-to-first-token — the answer's first
-           token arrives much later on a reasoning model. */
-        onReasoning: (delta) => {
-          recordToken()
-          updateMessages((current) => current.map((item) =>
-            item.id === assistant.id ? { ...item, reasoning: (item.reasoning ?? "") + delta } : item,
-          ))
-        },
-        onDelta: (delta) => {
-          recordToken()
-          updateMessages((current) => current.map((item) =>
-            item.id === assistant.id ? { ...item, content: item.content + delta } : item,
-          ))
-        },
-      })
-      const finalRate = decodeTokensPerSecond(
-        result.usage?.completion_tokens ?? count, firstTokenAt, performance.now(),
-      )
-      if (finalRate !== null) setTokPerSec(finalRate)
-      if (result.usage) setTotalTokens(prev => ({
-        prompt: prev.prompt + (result.usage?.prompt_tokens || 0),
-        completion: prev.completion + (result.usage?.completion_tokens || 0),
-      }))
-      setLastRun(result)
-      setConnected(true)
+      /* tool loop: the model may call web_search; its results go back as a tool
+         message and the model continues, at most four rounds per user turn */
+      for (let round = 0; round < 4; round++) {
+        const target = assistant
+        let assistantContent = ""
+        let assistantReasoning = ""
+        const result = await streamChat({
+          baseUrl,
+          apiKey,
+          model,
+          messages: requestFor(history),
+          tools: webSearchEnabled ? WEB_SEARCH_TOOLS : undefined,
+          temperature,
+          maxTokens,
+          enableThinking: thinking,
+          reasoningEffort,
+          preserveThinking,
+          reasoningBudget,
+          speculativeDecoding,
+          gpuRouter,
+          cacheSlot: supportsCacheSlots(health) ? cacheSlot : undefined,
+          signal: controller.signal,
+          /* Reasoning tokens are tokens: they count toward the rate, and the
+             first one is the real time-to-first-token — the answer's first
+             token arrives much later on a reasoning model. */
+          onReasoning: (delta) => {
+            recordToken()
+            assistantReasoning += delta
+            updateMessages((current) => current.map((item) =>
+              item.id === target.id ? { ...item, reasoning: (item.reasoning ?? "") + delta } : item,
+            ))
+          },
+          onDelta: (delta) => {
+            recordToken()
+            assistantContent += delta
+            updateMessages((current) => current.map((item) =>
+              item.id === target.id ? { ...item, content: item.content + delta } : item,
+            ))
+          },
+        })
+        usageTotal.prompt += result.usage?.prompt_tokens || 0
+        usageTotal.completion += result.usage?.completion_tokens || 0
+        if (!result.toolCalls.length || round === 3) {
+          const finalRate = decodeTokensPerSecond(
+            usageTotal.completion || count, firstTokenAt, performance.now(),
+          )
+          if (finalRate !== null) setTokPerSec(finalRate)
+          setTotalTokens(prev => ({ prompt: prev.prompt + usageTotal.prompt, completion: prev.completion + usageTotal.completion }))
+          setLastRun(result)
+          setConnected(true)
+          break
+        }
+        const called: ChatMessage = { ...target, content: assistantContent, reasoning: assistantReasoning || undefined, toolCalls: result.toolCalls }
+        updateMessages((current) => current.map((item) => (item.id === target.id ? called : item)))
+        const toolMessages: ChatMessage[] = []
+        for (const call of result.toolCalls) {
+          let body: string
+          try {
+            const args = JSON.parse(call.arguments || "{}") as { query?: unknown; num?: unknown }
+            if (call.name !== "web_search") throw new Error(`unknown tool ${call.name}`)
+            const query = String(args.query ?? "").trim()
+            if (!query) throw new Error("web_search needs a query")
+            body = JSON.stringify(await webSearchCall(baseUrl, apiKey, serperApiKey.trim(), query, Number(args.num) || 5))
+          } catch (cause) {
+            body = JSON.stringify({ error: cause instanceof Error ? cause.message : String(cause) })
+          }
+          const reply = message("tool", body)
+          reply.toolCallId = call.id
+          reply.toolName = call.name
+          toolMessages.push(reply)
+        }
+        history = [...history, called, ...toolMessages]
+        assistant = message("assistant", "")
+        updateMessages([...history, assistant])
+      }
     } catch (cause) {
       if (controller.signal.aborted) {
         updateMessages((current) => current.filter((item) => item.id !== assistant.id || item.content || item.reasoning))
@@ -517,7 +571,9 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <aside className="sidebar">
+      {sidebarOpen ? <div className="sidebar-backdrop" onClick={() => setSidebarOpen(false)} aria-hidden="true" /> : null}
+      <aside className={sidebarOpen ? "sidebar open" : "sidebar"} aria-label={t("nav.settings")}>
+        <button type="button" className="sidebar-close" onClick={() => setSidebarOpen(false)} aria-label={t("nav.close")}><X className="size-4" /></button>
         <div className="brand-row">
           <div className="brand-mark"><Waypoints className="size-5" /></div>
           <div><h1>{t("brand.name")}</h1><p>{t("brand.subtitle")}</p><p className="brand-tagline">{t("brand.tagline")}</p></div>
@@ -638,6 +694,15 @@ export default function App() {
         </section>
 
         <section className="side-section">
+          <div className="section-title"><Globe className="size-3.5" /> {t("sidebar.webSearch")}</div>
+          <label>{t("sidebar.serperKey")}<div className="relative"><KeyRound className="field-icon" /><Input className="pl-9" type="password" value={serperApiKey} placeholder={t("sidebar.serperKeyPlaceholder")} onChange={(event) => setSerperApiKey(event.target.value)} autoComplete="off" /></div><span className="field-help">{t("sidebar.serperKeyHelp")}</span></label>
+          <button type="button" className={cn("toggle-row", webSearchEnabled && "active")} aria-pressed={webSearchEnabled} disabled={serperApiKey.trim().length < 8} onClick={() => setWebSearch((value) => !value)}>
+            <span><Globe className="size-4" /> {t("sidebar.webSearchToggle")}</span><i><b /></i>
+          </button>
+          <span className="field-help">{t("sidebar.webSearchHelp")}</span>
+        </section>
+
+        <section className="side-section">
           <div className="section-title"><MessageSquareText className="size-3.5" /> {t("sidebar.systemPrompt")}</div>
           <label>{t("sidebar.systemPromptNewChats")}<Textarea className="system-prompt" value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} placeholder={t("sidebar.systemPromptPlaceholder")} /><span className="field-help">{t("sidebar.systemPromptHelp")}</span></label>
           <button type="button" className={cn("toggle-row", useSystemPrompt && "active")} aria-pressed={useSystemPrompt} onClick={() => setUseSystemPrompt((value) => !value)}>
@@ -717,7 +782,8 @@ export default function App() {
 
       <main className="chat-panel">
         <header className="topbar">
-          <div><span className="eyebrow">{t("topbar.activeModel")}</span><strong>{health?.backend?.model || model}</strong></div>
+          <button type="button" className="sidebar-toggle" onClick={() => setSidebarOpen(true)} aria-label={t("nav.settings")} aria-expanded={sidebarOpen}><SlidersHorizontal className="size-4" /></button>
+          <div className="topbar-model"><span className="eyebrow">{t("topbar.activeModel")}</span><strong>{health?.backend?.model || model}</strong></div>
           <div className="view-tabs">
             <button className={view === "chat" ? "active" : ""} onClick={() => setView("chat")}><MessageSquareText className="size-3.5" /> {t("nav.chat")}</button>
             {showBrain ? <button className={view === "brain" ? "active" : ""} onClick={() => setView("brain")}><BrainCircuit className="size-3.5" /> {t("nav.brain")}</button> : null}
@@ -731,6 +797,7 @@ export default function App() {
               {!loading && lastRun?.usage ? <Badge><Layers className="size-3" /> {lastRun.usage.prompt_tokens}→{lastRun.usage.completion_tokens}</Badge> : null}
               {!loading && lastRun?.finishReason === "length" ? <Badge className="badge-warn" title={t("topbar.truncatedHelp")}><AlertTriangle className="size-3" /> {t("topbar.truncated")}</Badge> : null}
               {lastRun?.queueWaitMs != null ? <Badge><Clock className="size-3" /> queue {Math.round(lastRun.queueWaitMs)}ms</Badge> : null}
+              <Badge className="badge-meter mobile-only" title={`${t("dashboard.session")}: ${totalTokens.prompt.toLocaleString()} ${t("dashboard.prompt")} + ${totalTokens.completion.toLocaleString()} ${t("dashboard.completion")}`}><Database className="size-3" /> {totalTokens.prompt.toLocaleString()}→{totalTokens.completion.toLocaleString()}</Badge>
               <Badge><MonitorDot className="size-3" /> {t("topbar.slot", { n: cacheSlot + 1 })}</Badge>
               <Button variant="ghost" size="sm" onClick={() => void clear()} disabled={!connected || loading}><Trash2 className="size-3.5" /> {t("topbar.clear")}</Button>
             </div>
@@ -746,12 +813,24 @@ export default function App() {
               <div className="orb"><Waypoints /></div>
               <h2 className="empty-wordmark">{t("brand.name")}</h2>
               <div className="suggestions">
-                {[t("prompts.routing"), t("prompts.benchmark"), t("prompts.caching")].map((item) => <button key={item} onClick={() => setDraft(item)}>{item}<ArrowUp className="size-3.5 rotate-45" /></button>)}
+                {suggestions.map((card) => <button key={card.id} onClick={() => setDraft(card.text)}>{card.text}<ArrowUp className="size-3.5 rotate-45" /></button>)}
               </div>
             </div>
           ) : (
             <div className="message-list">
-              {messages.map((item) => (
+              {messages.map((item) => item.role === "tool" ? (
+                <article key={item.id} className="message tool">
+                  <div className="avatar"><Globe className="size-4" /></div>
+                  <div><div className="message-meta">{t("chat.webSearch")}</div>{(() => {
+                    const found = parseWebSearchResult(item.content)
+                    return <details className="tool-result">
+                      <summary>{found.error ? `${t("chat.searchFailed")}: ${found.error}` : t("chat.searchResults", { q: found.query, n: found.results.length })}</summary>
+                      {found.answer ? <p className="tool-answer">{found.answer}</p> : null}
+                      <ul>{found.results.map((hit, index) => <li key={index}><a href={hit.link} target="_blank" rel="noreferrer">{hit.title || hit.link}</a>{hit.snippet ? <span> {hit.snippet}</span> : null}</li>)}</ul>
+                    </details>
+                  })()}</div>
+                </article>
+              ) : (
                 <article key={item.id} className={cn("message", item.role)}>
                   <div className="avatar">{item.role === "user" ? "Y" : <Waypoints className="size-4" />}</div>
                   <div><div className="message-meta">{item.role === "user" ? t("chat.you") : t("chat.assistant")}</div><div className="message-body">{item.reasoning
@@ -766,7 +845,11 @@ export default function App() {
                            model's output is markdown. */
                         ? <Markdown source={item.content} />
                         : item.content)
-                    : <span className="typing" aria-label="Generating"><i /><i /><i /></span>}</div>
+                    : item.toolCalls && item.toolCalls.length
+                      ? null
+                      : <span className="typing" aria-label="Generating"><i /><i /><i /></span>}{item.toolCalls && item.toolCalls.length
+                    ? <div className="tool-calls">{item.toolCalls.map((call) => <span key={call.id || call.name}><Globe className="size-3" /> {t("chat.searching", { q: parseWebSearchResult.query(call.arguments) })}</span>)}</div>
+                    : null}</div>
                   {item.images && item.images.length ? (
                     /* the attachments of that turn, kept on the message (they are
                        resent with the history) and shown where they were sent */

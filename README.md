@@ -1,4 +1,4 @@
-# AI-DER 1.1.1
+# AI-DER 1.2.0
 
 **Artificial Intelligence Distributed Engram Runner** is a local inference runner
 for Qwen3.8-Flash-Next quantized mixture-of-experts models. It combines SSD-backed
@@ -36,7 +36,7 @@ sudo apt-get update
 sudo apt-get install -y git
 git clone https://github.com/tbro0815/ai-der.git
 cd ai-der
-git checkout v1.1.1
+git checkout v1.2.0
 ./install.sh --check
 ./install.sh
 ```
@@ -85,6 +85,15 @@ the dashboard switches to llama.cpp or vLLM at the next restart and selects the
 vLLM profile (`long`, 131K, or `fast`, 64K, which locks the backend to vLLM).
 With `--systemd`: `systemctl --user enable --now ai-der.service`.
 
+**Web search in the chat.** Enter a [Serper](https://serper.dev) API key in the
+sidebar's Web Search section and switch the tool on: the dashboard then declares
+one function tool, `web_search`, on every request of the chat, so the model can
+search from the first turn. The key stays in the browser's local storage and
+travels with each search to `/v1/tools/web_search`, where the gateway relays the
+query to Serper and returns titles, links and snippets as a tool message; the
+server never stores the key. Works on every backend, since tool calls are parsed
+by the gateway.
+
 For LAN access set `COLI_API_KEY`, configure `COLI_ALLOWED_HOSTS` for your server
 hostname/IP (both have commented placeholders in `ai-der.env`), and bind to
 `0.0.0.0`. Keep credentials outside the repository.
@@ -111,7 +120,7 @@ Qwen repository and `engine/c/convert_mtp.py` writes `<container>/mtp`.
 Python package metadata and `ai-der --version` (`coli` remains an alias).
 Use semantic versioning: MAJOR for incompatible changes, MINOR for compatible
 features, PATCH for fixes. Releases are tagged `vMAJOR.MINOR.PATCH`; this release
-is **v1.1.1**. Internal upstream component metadata is independent.
+is **v1.2.0**. Internal upstream component metadata is independent.
 
 ```bash
 .venv/bin/ai-der --version

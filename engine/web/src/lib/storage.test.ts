@@ -22,6 +22,8 @@ describe("browser settings persistence", () => {
     reasoningEffort: "xhigh",
     thinking: true,
     preserveThinking: true,
+    serperApiKey: "",
+    webSearch: false,
     reasoningBudget: 8192,
     speculativeDecoding: true,
     gpuRouter: true,
