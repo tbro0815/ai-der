@@ -4139,7 +4139,9 @@ def resolve_backend(requested=None, settings_file=None, env=None):
     COLI_BACKEND, else the AI-DER engine.  An unconfigured choice falls back
     to it with a warning (a configuration error, not an automatic selection)."""
     env = os.environ if env is None else env
-    choice = canonical_backend(requested or saved_backend(settings_file)
+    # the fast vLLM profile locks the backend to vLLM while it is selected
+    locked = "vllm" if saved_vllm_profile(settings_file) == "fast" else None
+    choice = canonical_backend(requested or locked or saved_backend(settings_file)
                                or env.get("COLI_BACKEND") or "aider")
     if choice not in BACKEND_IDS:
         raise ValueError(f"unknown backend {choice!r} (one of {', '.join(BACKEND_IDS)})")
@@ -5050,6 +5052,7 @@ class APIServer(ThreadingHTTPServer):
                 "backend_next": self.backend_next or self.backend_id,
                 "backends": available_backends(),
                 "vllm_profile": self.vllm_profile or "long",
+                "backend_locked": "vllm" if self.vllm_profile == "fast" else None,
                 "vllm_profile_active": (self.engine.backend.get("profile")
                                         if self.engine is not None and self.backend_id == "vllm" else None),
                 "vllm_profiles": {k: {"context": v["context"], "note": v["note"]} for k, v in VLLM_PROFILES.items()},
@@ -5085,6 +5088,17 @@ class APIServer(ThreadingHTTPServer):
                 raise APIError(400, f"`vllm_profile` must be one of {', '.join(VLLM_PROFILES)}; "
                                     "it applies to the vLLM backend at its next start.",
                                "vllm_profile", "invalid_value")
+            if vllm_profile == "fast":
+                # the 64K profile is only meaningful on vLLM: selecting it moves the next
+                # backend to vLLM and holds it there until `long` is selected again
+                if "vllm" not in available_backends():
+                    raise APIError(400, "`vllm_profile` fast needs the vLLM backend configured.",
+                                   "vllm_profile", "invalid_value")
+                if "backend" in body and backend != "vllm":
+                    raise APIError(400, "`backend` is locked to vllm while the fast vLLM profile is "
+                                        "selected; choose the long profile first.",
+                                   "backend", "invalid_value")
+                backend = "vllm"
             api_defaults = dict(self.api_defaults)
             if "api_defaults" in body:
                 for key, value in validate_api_defaults(body["api_defaults"]).items():

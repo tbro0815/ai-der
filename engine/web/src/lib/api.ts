@@ -120,6 +120,8 @@ export interface ServerSettings {
   backend_error?: string
   /** vLLM launcher profile: the persisted choice (next start), the running one, the catalogue */
   vllm_profile?: string
+  /** set while the fast profile holds the next backend on vLLM */
+  backend_locked?: string | null
   vllm_profile_active?: string | null
   vllm_profiles?: Record<string, { context: number; note: string }>
   /** dashboard "Extra": defaults for API clients that omit the field */

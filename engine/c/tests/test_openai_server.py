@@ -3507,6 +3507,15 @@ class BackendSelectionTest(unittest.TestCase):
                 payload = server.update_settings({"vllm_profile": "fast"})
                 self.assertEqual(payload["vllm_profile"], "fast")
                 self.assertIsNone(payload["vllm_profile_active"])          # AI-DER is serving
+                # fast locks the next backend to vLLM until long is selected again
+                self.assertEqual((payload["backend_next"], payload["backend_locked"]), ("vllm", "vllm"))
+                with self.assertRaises(APIError):
+                    server.update_settings({"backend": "aider"})
+                self.assertEqual(resolve_backend(None, path), "vllm")
+                unlocked = server.update_settings({"vllm_profile": "long"})
+                self.assertIsNone(unlocked["backend_locked"])
+                self.assertEqual(server.update_settings({"backend": "aider"})["backend_next"], "aider")
+                server.update_settings({"vllm_profile": "fast"})
                 with self.assertRaises(APIError):
                     server.update_settings({"vllm_profile": "huge"})
             finally:

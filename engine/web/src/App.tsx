@@ -675,9 +675,9 @@ export default function App() {
           {serverSettings?.backends && serverSettings.backends.length > 1 ? (
             <label className="backend-choice">{t("sidebar.backend")}
               <select value={serverSettings.backend_next || serverSettings.backend} disabled={switchingBackend} onChange={(event) => void chooseBackend(event.target.value)}>
-                {serverSettings.backends.map((id) => <option key={id} value={id}>{backendLabel(id)}</option>)}
+                {serverSettings.backends.map((id) => <option key={id} value={id} disabled={!!serverSettings.backend_locked && id !== serverSettings.backend_locked}>{backendLabel(id)}{serverSettings.backend_locked && id !== serverSettings.backend_locked ? ` (${t("sidebar.backendUnavailable")})` : ""}</option>)}
               </select>
-              <span className="field-help">{serverSettings.backend_error ? `${t("sidebar.backendFailed")} ${serverSettings.backend_error}` : serverSettings.backend_next && serverSettings.backend_next !== serverSettings.backend ? t("sidebar.backendPending") : t("sidebar.backendHelp")}</span>
+              <span className="field-help">{serverSettings.backend_error ? `${t("sidebar.backendFailed")} ${serverSettings.backend_error}` : serverSettings.backend_locked ? t("sidebar.backendLocked") : serverSettings.backend_next && serverSettings.backend_next !== serverSettings.backend ? t("sidebar.backendPending") : t("sidebar.backendHelp")}</span>
             </label>
           ) : null}
           {serverSettings?.backends?.includes("vllm") && serverSettings.vllm_profiles ? (
