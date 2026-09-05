@@ -2985,6 +2985,10 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length) or b"{}")
         type(self).seen.append((self.path, body))
         script = type(self).script
+        if self.path == "/reset_prefix_cache":                 # vLLM dev-mode endpoint
+            self.send_response(200); self.send_header("Content-Length", "2"); self.end_headers()
+            self.wfile.write(b"{}")
+            return
         if self.path == "/tokenize":
             text = body.get("content", body.get("prompt", ""))
             if isinstance(text, dict):
@@ -3462,6 +3466,17 @@ class BackendSelectionTest(unittest.TestCase):
                 self.assertEqual(second.warm_prefixes(), 1)
                 self.assertEqual(_UpstreamHandler.seen[0][1]["prompt"], stored[0].read_text())
                 self.assertEqual(_UpstreamHandler.seen[0][1]["max_tokens"], 1)
+                # cache reset on vLLM: the dev-mode endpoint plus the stored prefix texts
+                self.assertFalse(second.supports_cache_reset)         # no VLLM_SERVER_DEV_MODE in env
+                with patch("openai_server.ARCH", "qwen38"):
+                    third = ProxyEngine("vllm", "qwen3.8-flash-next-aider",
+                                        env=dict(env, COLI_VLLM_ENV="VLLM_SERVER_DEV_MODE=1"), spawn=False)
+                self.assertTrue(third.supports_cache_reset)
+                _UpstreamHandler.seen = []
+                third.reset_cache(0)
+                self.assertEqual(_UpstreamHandler.seen[0][0], "/reset_prefix_cache")
+                self.assertEqual(list(Path(tmp).glob("prefix-*.txt")), [])
+                third.close()
                 second.close()
         finally:
             upstream.shutdown(); upstream.server_close()

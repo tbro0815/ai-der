@@ -4319,7 +4319,10 @@ class ProxyEngine(Engine):
                         "upstream": f"http://{self.host}:{self.port}",
                         "context_window": self.context_window, "images": self.images}
         self._init_state(arch, kv_slots)
-        self.supports_cache_reset = backend == "llamacpp"
+        # llama.cpp erases a slot; vLLM resets its prefix cache server-wide, but only
+        # exposes that endpoint when started with VLLM_SERVER_DEV_MODE=1 (the unit sets it)
+        self.supports_cache_reset = (backend == "llamacpp" or
+                                     (backend == "vllm" and environ.get("VLLM_SERVER_DEV_MODE") == "1"))
         self.dispatcher = None
         self.process = None
         self._win_job = None
@@ -4925,6 +4928,28 @@ class ProxyEngine(Engine):
         if (isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or
                 not 0 <= cache_slot < self.kv_slots):
             raise APIError(400, "Invalid cache slot.", "cache_slot")
+        if self.backend_id == "vllm":
+            # server-wide (vLLM has no slots): drop its prefix cache and the stored
+            # prefix texts that would re-warm it at the next start
+            conn = http.client.HTTPConnection(self.host, self.port, timeout=30.0)
+            try:
+                conn.request("POST", "/reset_prefix_cache", "{}", {"Content-Type": "application/json"})
+                response = conn.getresponse()
+                body = response.read()
+                if response.status == 404:
+                    raise RuntimeError("vLLM was started without VLLM_SERVER_DEV_MODE=1; "
+                                       "/reset_prefix_cache is not exposed")
+                if response.status != 200:
+                    raise RuntimeError(f"vLLM prefix cache reset failed ({response.status}): "
+                                       f"{body[:200].decode('utf-8', 'replace')}")
+            finally:
+                conn.close()
+            for stored in self.prefixes_dir.glob("prefix-*.txt"):
+                try:
+                    stored.unlink()
+                except OSError:
+                    pass
+            return
         if self.backend_id != "llamacpp":
             return
         conn = http.client.HTTPConnection(self.host, self.port, timeout=30.0)
