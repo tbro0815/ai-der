@@ -47,6 +47,35 @@ import { Markdown } from "@/components/Markdown"
 import { cn } from "@/lib/utils"
 import { useLocale } from "./i18n"
 
+/* Phone photos are 3-8 MB and travel base64-encoded inside the JSON request; the vision
+   tower resizes to about 1.5K pixels on its longest edge anyway. Downscale and re-encode
+   here so a turn stays well under the gateway's body limit and uploads fast on mobile. */
+const MAX_IMAGE_EDGE = 1568
+async function imageDataUrl(file: File): Promise<string> {
+  const original = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result))
+    reader.onerror = () => reject(reader.error)
+    reader.readAsDataURL(file)
+  })
+  if (file.size < 400 * 1024 || file.type === "image/gif") return original
+  try {
+    const bitmap = await createImageBitmap(file)
+    const scale = Math.min(1, MAX_IMAGE_EDGE / Math.max(bitmap.width, bitmap.height))
+    const canvas = document.createElement("canvas")
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale))
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale))
+    const context = canvas.getContext("2d")
+    if (!context) return original
+    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height)
+    bitmap.close()
+    const jpeg = canvas.toDataURL("image/jpeg", 0.85)
+    return jpeg.length < original.length ? jpeg : original
+  } catch {
+    return original
+  }
+}
+
 const message = (role: ChatMessage["role"], content: string): ChatMessage => {
   let id: string
   try { id = crypto.randomUUID() } catch { id = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => { const r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16) }) }
@@ -165,17 +194,7 @@ export default function App() {
     if (all.some((file) => file.type.startsWith("audio/"))) setError("chat.audioUnsupported")
     else if (all.length && !images.length) setError("chat.attachNotImage")
     if (!images.length) return
-    const read = await Promise.all(
-      images.map(
-        (file) =>
-          new Promise<{ name: string; url: string }>((resolve, reject) => {
-            const reader = new FileReader()
-            reader.onload = () => resolve({ name: file.name, url: String(reader.result) })
-            reader.onerror = () => reject(reader.error)
-            reader.readAsDataURL(file)
-          }),
-      ),
-    )
+    const read = await Promise.all(images.map(async (file) => ({ name: file.name, url: await imageDataUrl(file) })))
     setAttachments((current) => [...current, ...read])
   }
   const [loading, setLoading] = useState(false)

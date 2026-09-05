@@ -50,7 +50,7 @@ def default_engine(family=None):
     return HERE / family.engine_artifact
 END = b"\x01\x01END\x01\x01\n"
 READY = b"\x01\x01READY\x01\x01\n"
-MAX_BODY = 4 << 20
+MAX_BODY = 24 << 20   # image turns: up to 32 data-URI images per request (the dashboard downsizes to ~1 MB each)
 PROFILE_TURNS = 120           # rolling window of per-turn PROF snapshots kept for /profile
 TELEMETRY_EVENTS = 240        # bounded live request log kept for /telemetry
 MAX_SYSTEM_PROMPT = 65536
