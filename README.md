@@ -79,7 +79,7 @@ set -a; source ai-der.env; set +a
   --host 127.0.0.1 --port 8080 --ngen 32768
 ```
 
-Open [the dashboard](http://127.0.0.1:8080); the API base URL is
+Open `http://127.0.0.1:8080` in a browser for the dashboard; the API base URL is
 `http://127.0.0.1:8080/v1`. The default backend is AI-DER; the Extra section of
 the dashboard switches to llama.cpp or vLLM at the next restart and selects the
 vLLM profile (`long`, 131K, or `fast`, 64K, which locks the backend to vLLM).
