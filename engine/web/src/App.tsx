@@ -36,7 +36,7 @@ import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { pickSuggestions } from "@/prompts"
 import { WEB_SEARCH_TOOLS, parseWebSearchResult } from "@/tools"
-import { type PrefillProgress, getHealth, getServerSettings, listModels, resetCache, restartServer, streamChat, updateApiDefaults, updateServerBackend, updateVllmProfile, webSearch as webSearchCall, updateServerSettings, withSystemPrompt, type ChatMessage, type HealthResponse, type ServerSettings, type StreamChatResult } from "@/lib/api"
+import { type PrefillProgress, getHealth, getServerSettings, listModels, resetCache, restartServer, streamChat, updateApiDefaults, updateServerBackend, updateContextProfile, webSearch as webSearchCall, updateServerSettings, withSystemPrompt, type ChatMessage, type HealthResponse, type ServerSettings, type StreamChatResult } from "@/lib/api"
 import { activeRequests, decodeTokensPerSecond, supportsCacheSlots } from "@/lib/runtime"
 import { Brain } from "./Brain"
 import { Profiling } from "./Profiling"
@@ -234,12 +234,14 @@ export default function App() {
       setSwitchingBackend(false)
     }
   }
-  const chooseVllmProfile = async (profile: string) => {
-    if (!serverSettings || profile === serverSettings.vllm_profile) return
-    if (profile === "fast" && !window.confirm(t("sidebar.vllmFastConfirm"))) return
+  const chooseContextProfile = async (profile: string) => {
+    if (!serverSettings || profile === serverSettings.context_profile) return
+    if (profile === "fast" && !window.confirm(t("sidebar.contextFastConfirm"))) return
+    if (profile === "long" && !window.confirm(t("sidebar.contextLongConfirm"))) return
+    if (profile === "vllm-190k" && !window.confirm(t("sidebar.contextVllm190kConfirm"))) return
     setSwitchingBackend(true)
     try {
-      setServerSettings(await updateVllmProfile(baseUrl, apiKey, profile))
+      setServerSettings(await updateContextProfile(baseUrl, apiKey, profile))
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause))
     } finally {
@@ -759,17 +761,18 @@ export default function App() {
           {serverSettings?.backends && serverSettings.backends.length > 1 ? (
             <label className="backend-choice">{t("sidebar.backend")}
               <select value={serverSettings.backend_next || serverSettings.backend} disabled={switchingBackend} onChange={(event) => void chooseBackend(event.target.value)}>
-                {serverSettings.backends.map((id) => <option key={id} value={id} disabled={!!serverSettings.backend_locked && id !== serverSettings.backend_locked}>{backendLabel(id)}{serverSettings.backend_locked && id !== serverSettings.backend_locked ? ` (${t("sidebar.backendUnavailable")})` : ""}</option>)}
+                {serverSettings.backends.map((id) => <option key={id} value={id} disabled={!!serverSettings.backend_locked && id !== serverSettings.backend_locked}>{backendLabel(id)}{serverSettings.backend_locked && id !== serverSettings.backend_locked ? ` (${t("sidebar.backendUnavailable", { profile: serverSettings.context_profile || "" })})` : ""}</option>)}
               </select>
-              <span className="field-help">{serverSettings.backend_error ? `${t("sidebar.backendFailed")} ${serverSettings.backend_error}` : serverSettings.backend_locked ? t("sidebar.backendLocked") : serverSettings.backend_next && serverSettings.backend_next !== serverSettings.backend ? t("sidebar.backendPending") : t("sidebar.backendHelp")}</span>
+              <span className="field-help">{serverSettings.backend_error ? `${t("sidebar.backendFailed")} ${serverSettings.backend_error}` : serverSettings.backend_locked ? t("sidebar.backendLocked", { backend: backendLabel(serverSettings.backend_locked), profile: serverSettings.context_profile || "" }) : serverSettings.backend_next && serverSettings.backend_next !== serverSettings.backend ? t("sidebar.backendPending") : t("sidebar.backendHelp")}</span>
+              {serverSettings.backend_locked ? <Button type="button" variant="secondary" size="sm" disabled={switchingBackend} onClick={() => void chooseContextProfile("standard")}>{t("sidebar.unlockStandard")}</Button> : null}
             </label>
           ) : null}
-          {serverSettings?.backends?.includes("vllm") && serverSettings.vllm_profiles ? (
-            <label className="backend-choice">{t("sidebar.vllmProfile")}
-              <select value={serverSettings.vllm_profile || "long"} disabled={switchingBackend} onChange={(event) => void chooseVllmProfile(event.target.value)}>
-                {Object.entries(serverSettings.vllm_profiles).map(([id, info]) => <option key={id} value={id}>{id} · {Math.round(info.context / 1024)}K</option>)}
+          {serverSettings?.context_profiles && Object.keys(serverSettings.context_profiles).length > 1 ? (
+            <label className="backend-choice">{t("sidebar.contextProfile")}
+              <select value={serverSettings.context_profile || "standard"} disabled={switchingBackend} onChange={(event) => void chooseContextProfile(event.target.value)}>
+                {Object.entries(serverSettings.context_profiles).map(([id, info]) => <option key={id} value={id}>{info.label && info.label !== id ? info.label : `${id} · ${Math.round(info.context / 1024)}K${info.backend ? ` · ${backendLabel(info.backend)}` : ""}`}</option>)}
               </select>
-              <span className="field-help">{serverSettings.backend === "vllm" && serverSettings.vllm_profile_active && serverSettings.vllm_profile_active !== (serverSettings.vllm_profile || "long") ? t("sidebar.vllmProfilePending") : t("sidebar.vllmProfileHelp")}</span>
+              <span className="field-help">{serverSettings.context_profile_active && serverSettings.context_profile_active !== (serverSettings.context_profile || "standard") ? t("sidebar.contextProfilePending") : t("sidebar.contextProfileHelp")}</span>
             </label>
           ) : null}
           {restartSupported ? (

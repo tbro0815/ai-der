@@ -130,12 +130,13 @@ export interface ServerSettings {
   backends?: string[]
   /** set when the chosen backend failed to start and AI-DER serves instead */
   backend_error?: string
-  /** vLLM launcher profile: the persisted choice (next start), the running one, the catalogue */
-  vllm_profile?: string
-  /** set while the fast profile holds the next backend on vLLM */
+  /** context profile (fast 80K | standard 131K | vllm-190k | long 262K): the persisted
+   *  choice (next start), the running one, the catalogue of selectable ones */
+  context_profile?: string
+  /** set while a profile holds the next backend (fast, vllm-190k: vllm; long: llamacpp) */
   backend_locked?: string | null
-  vllm_profile_active?: string | null
-  vllm_profiles?: Record<string, { context: number; note: string }>
+  context_profile_active?: string | null
+  context_profiles?: Record<string, { context: number; note: string; backend: string | null; label?: string }>
   /** dashboard "Extra": defaults for API clients that omit the field */
   api_defaults?: ApiDefaults
 }
@@ -345,7 +346,7 @@ export async function updateServerSettings(
   return (await response.json()) as ServerSettings
 }
 
-export async function updateVllmProfile(
+export async function updateContextProfile(
   baseUrl: string,
   apiKey: string,
   profile: string,
@@ -355,7 +356,7 @@ export async function updateVllmProfile(
     method: "PATCH",
     headers: headers(apiKey),
     signal,
-    body: JSON.stringify({ vllm_profile: profile }),
+    body: JSON.stringify({ context_profile: profile }),
   })
   if (!response.ok) throw new Error(await responseError(response))
   return (await response.json()) as ServerSettings

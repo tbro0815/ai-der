@@ -12,6 +12,7 @@ import collections
 import contextlib
 import hashlib
 import json
+import fnmatch
 import math
 import mimetypes
 import os
@@ -3493,7 +3494,7 @@ class Engine:
         # the runtime panel names the model, not the container directory
         container = os.path.basename(self.model_dir.rstrip("/\\")) or self.model_dir
         shown = getattr(family, "display_name", None)
-        self.backend = {"id": "aider", "label": BACKEND_LABELS["aider"],
+        self.backend = {"id": "aider", "label": BACKEND_LABELS["aider"], "profile": "standard",
                         "model": f"{shown}-Aider" if shown else container,
                         "context_window": self.context_window, "images": True}
         read_engine_turn(self.process.stdout, READY, lambda _: None)
@@ -4157,27 +4158,77 @@ def available_backends(env=None):
     return [b for b in BACKEND_IDS if backend_configured(b, env)]
 
 
-# vLLM launcher profiles (syv-ai start_qwen.sh `CTX`): the persisted `vllm_profile`
-# setting overrides the unit's CTX/MAX_LEN and the advertised window at the next
-# restart.  `fast` knowingly breaks the one-context contract while selected (64K).
-VLLM_PROFILES = {
-    "long": {"CTX": "long", "MAX_LEN": "131072", "context": 131072,
-             "note": "fp8 KV cache, 131K window, ~76-83 tok/s decode"},
-    "fast": {"CTX": "fast", "MAX_LEN": "65536", "context": 65536,
-             "note": "bf16 KV cache, 64K window, ~111-157 tok/s decode"},
+# Context profiles: the persisted `context_profile` setting fixes the advertised
+# window at the next restart.  `standard` (131K) is the one-context contract every
+# backend serves.  `fast` (80K, vLLM launcher CTX=fast), `vllm-190k` (vLLM's fp8
+# KV pool used to its safe size) and `long` (262K, the model's native length,
+# llama.cpp with a q8_0 KV cache) each knowingly leave that contract while
+# selected and lock the backend to the one that serves them.
+CONTEXT_PROFILES = {
+    # 80K: the bf16 KV pool holds 85,196 tokens with the vision tower on
+    # (vLLM log, 2026-09-27); the launcher's own default is 64K
+    "fast": {"context": 81920, "backend": "vllm",
+             "vllm": {"CTX": "fast", "MAX_LEN": "81920"},
+             "note": "vLLM only: 80K window, bf16 KV cache, ~111-157 tok/s decode"},
+    "standard": {"context": 131072, "backend": None,
+                 "vllm": {"CTX": "long", "MAX_LEN": "131072"},
+                 "note": "every backend: 131K window"},
+    "long": {"context": 262144, "backend": "llamacpp",
+             "note": "llama.cpp only: 262K window (the model's native length), q8_0 KV cache"},
+    # the standard fp8 launch with a longer MAX_LEN: the fp8 KV pool held
+    # 196,229-197,744 tokens with the vision tower on (vLLM logs, 2026-09-03 and
+    # 09-27); 190,464 (93 x 2048) keeps ~3 % below the smallest pool seen, since
+    # vLLM refuses to start when one request at MAX_LEN does not fit the pool
+    "vllm-190k": {"context": 190464, "backend": "vllm", "label": "vLLM 190K",
+                  "vllm": {"CTX": "long", "MAX_LEN": "190464"},
+                  "note": "vLLM only: 190K window, fp8 KV cache, standard-profile speed"},
 }
+DEFAULT_CONTEXT_PROFILE = "standard"
+# settings files and clients from before the rename (`vllm_profile`: fast | long)
+LEGACY_VLLM_PROFILES = {"fast": "fast", "long": "standard"}
 
 
-def saved_vllm_profile(settings_file):
-    """The persisted `vllm_profile` choice (PATCH /v1/settings), or None."""
+def context_profile_from(saved):
+    """The profile named by a settings dict or request body: `context_profile`,
+    else the legacy `vllm_profile` (whose `long` was today's `standard`)."""
+    if not isinstance(saved, dict):
+        return None
+    profile = saved.get("context_profile")
+    if profile is None:
+        profile = LEGACY_VLLM_PROFILES.get(saved.get("vllm_profile"))
+    return profile
+
+
+def available_context_profiles(env=None):
+    backends = available_backends(env)
+    return {name: info for name, info in CONTEXT_PROFILES.items()
+            if info["backend"] is None or info["backend"] in backends}
+
+
+def saved_context_profile(settings_file):
+    """The persisted `context_profile` choice (PATCH /v1/settings), or None."""
     if not settings_file:
         return None
     try:
         saved = json.loads(Path(settings_file).expanduser().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    profile = saved.get("vllm_profile") if isinstance(saved, dict) else None
-    return profile if profile in VLLM_PROFILES else None
+    profile = context_profile_from(saved)
+    return profile if profile in CONTEXT_PROFILES else None
+
+
+def _with_flag(args, names, value):
+    """args with the flag (any of its spellings) set to value."""
+    out, i, done = [], 0, False
+    while i < len(args):
+        if args[i] in names and i + 1 < len(args):
+            if not done:
+                out += [names[0], value]
+                done = True
+            i += 2
+            continue
+        out.append(args[i]); i += 1
+    return out if done else out + [names[0], value]
 
 
 def saved_backend(settings_file):
@@ -4197,8 +4248,9 @@ def resolve_backend(requested=None, settings_file=None, env=None):
     COLI_BACKEND, else the AI-DER engine.  An unconfigured choice falls back
     to it with a warning (a configuration error, not an automatic selection)."""
     env = os.environ if env is None else env
-    # the fast vLLM profile locks the backend to vLLM while it is selected
-    locked = "vllm" if saved_vllm_profile(settings_file) == "fast" else None
+    # a profile only one backend serves (fast: vLLM, long: llama.cpp) locks
+    # the backend while it is selected
+    locked = CONTEXT_PROFILES.get(saved_context_profile(settings_file), {}).get("backend")
     choice = canonical_backend(requested or locked or saved_backend(settings_file)
                                or env.get("COLI_BACKEND") or "aider")
     if choice not in BACKEND_IDS:
@@ -4305,6 +4357,16 @@ class ProxyEngine(Engine):
             model = environ.get("COLI_LLAMACPP_MODEL", "")
             port = int(environ.get("COLI_LLAMACPP_PORT", "8081"))
             extra = shlex.split(environ.get("COLI_LLAMACPP_ARGS", ""))
+            # persisted context profile: `long` raises the window to the model's
+            # native 262K with a q8_0 KV cache; `standard` keeps the unit's arguments
+            self.context_profile = (environ.get("COLI_CONTEXT_PROFILE")
+                                    or LEGACY_VLLM_PROFILES.get(environ.get("COLI_VLLM_PROFILE")) or None)
+            if self.context_profile == "long":
+                extra = _with_flag(extra, ("-c", "--ctx-size"), str(CONTEXT_PROFILES["long"]["context"]))
+                extra = _with_flag(extra, ("-ctk", "--cache-type-k"), "q8_0")
+                extra = _with_flag(extra, ("-ctv", "--cache-type-v"), "q8_0")
+            else:
+                self.context_profile = "standard"
             self.context_window = _flag_value(extra, ("-c", "--ctx-size"), default_ctx)
             # --slot-save-path enables the /slots/<id>?action=erase endpoint
             # behind DELETE /v1/cache/slots/<id>; nothing is saved there.
@@ -4346,15 +4408,20 @@ class ProxyEngine(Engine):
                 key, _, value = item.partition("=")
                 if key:
                     environ[key] = value
-            # persisted vllm_profile (dashboard Extra): overrides the unit's CTX /
-            # MAX_LEN and the advertised window for this start
-            self.profile = environ.get("COLI_VLLM_PROFILE") or None
-            if self.profile in VLLM_PROFILES:
-                environ["CTX"] = VLLM_PROFILES[self.profile]["CTX"]
-                environ["MAX_LEN"] = VLLM_PROFILES[self.profile]["MAX_LEN"]
-                self.context_window = VLLM_PROFILES[self.profile]["context"]
+            # persisted context profile (dashboard Extra): overrides the unit's CTX /
+            # MAX_LEN and the advertised window for this start (`long` is served by
+            # llama.cpp only; vLLM started under it runs the standard window)
+            self.context_profile = (environ.get("COLI_CONTEXT_PROFILE")
+                                    or LEGACY_VLLM_PROFILES.get(environ.get("COLI_VLLM_PROFILE")) or None)
+            if self.context_profile == "long":
+                self.context_profile = "standard"
+            if self.context_profile in CONTEXT_PROFILES:
+                launcher = CONTEXT_PROFILES[self.context_profile]["vllm"]
+                environ["CTX"] = launcher["CTX"]
+                environ["MAX_LEN"] = launcher["MAX_LEN"]
+                self.context_window = CONTEXT_PROFILES[self.context_profile]["context"]
             else:
-                self.profile = "fast" if environ.get("CTX", "fast") == "fast" else environ.get("CTX")
+                self.context_profile = "fast" if environ.get("CTX", "fast") == "fast" else "standard"
             # P6.5: the launcher keeps the vision tower with VISION=1; image
             # turns then go to the upstream chat endpoint (its per-prompt image
             # limit is COLI_VLLM_IMAGES, the launcher's default is 1)
@@ -4373,7 +4440,7 @@ class ProxyEngine(Engine):
             shown = re.sub(r"-\d{5}-of-\d{5}$", "", re.sub(r"\.gguf$", "", shown))
         self.backend = {"id": backend, "label": BACKEND_LABELS[backend],
                         "model": shown,
-                        **({"profile": self.profile} if backend == "vllm" and getattr(self, "profile", None) else {}),
+                        "profile": self.context_profile,
                         "upstream": f"http://{self.host}:{self.port}",
                         "context_window": self.context_window, "images": self.images}
         self._init_state(arch, kv_slots)
@@ -4627,6 +4694,23 @@ class ProxyEngine(Engine):
         payload = prompt.encode("utf-8")
         if b"\0" in payload:
             raise APIError(400, "NUL bytes are not supported in prompts.", "messages")
+        # Clamp the output to the window like the native engine does: clients
+        # such as Claude Code ask for a fixed 32K max_tokens, which together
+        # with a long prompt exceeds the window and the upstream refuses the
+        # whole request.  The prompt is counted by the upstream's tokenizer
+        # (+16 for the template tokens the chat endpoint path may add).
+        if image is None:
+            counted = self._count_tokens(prompt)
+            if counted is not None:
+                room = self.context_window - counted - 16
+                if room < 1:
+                    raise APIError(400, f"This model's maximum context length is {self.context_window} tokens, "
+                                        f"however your messages resulted in {counted} tokens.",
+                                   "messages", "context_length_exceeded")
+                if max_tokens > room:
+                    print(f"[api] max_tokens {max_tokens} clamped to {room} (prompt {counted}, "
+                          f"window {self.context_window})", file=sys.stderr)
+                    max_tokens = room
         with self.pending_lock:
             if self.closed:
                 raise RuntimeError("backend is shutting down")
@@ -5023,11 +5107,29 @@ class ProxyEngine(Engine):
             conn.close()
 
 
-def model_object(model_id, created):
+def model_object(model_id, created, display_name=None, context_window=None):
     # AI-DER-specific containers carry an -aider id; everything else is the
-    # unmodified colibri family lineup.
-    owner = "aider" if model_id.endswith("-aider") else "colibri"
-    return {"id": model_id, "object": "model", "created": created, "owned_by": owner}
+    # unmodified colibri family lineup.  The Anthropic fields (type,
+    # display_name, created_at) ride along so Anthropic clients (Claude Code,
+    # the Claude desktop app's gateway mode) can read the same list.  The served
+    # window goes out under the names clients look for: `context_length`
+    # (OpenRouter, LiteLLM), `max_model_len` (vLLM), `max_input_tokens`.
+    owner = "aider" if model_id.endswith("-aider") or display_name else "colibri"
+    entry = {"id": model_id, "object": "model", "created": created, "owned_by": owner,
+             "type": "model", "display_name": display_name or model_id,
+             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(created))}
+    if context_window:
+        entry.update(context_length=int(context_window), max_model_len=int(context_window),
+                     max_input_tokens=int(context_window))
+    return entry
+
+
+def advertised_model_ids():
+    """COLI_ADVERTISED_MODELS: extra concrete ids /v1/models lists as aliases of
+    the served model (the Claude desktop app's gateway mode picks a model from
+    this list and shows none unless it finds Claude ids).  They must also match
+    COLI_MODEL_ALIASES to be accepted on requests."""
+    return [m.strip() for m in os.environ.get("COLI_ADVERTISED_MODELS", "").split(",") if m.strip()]
 
 
 def _positive_env(name, default):
@@ -5090,7 +5192,7 @@ class APIServer(ThreadingHTTPServer):
         self._settings_lock = threading.Lock()
         self.backend_id = "aider"            # the running backend (serve() sets it)
         self.backend_next = None             # persisted choice, applied by the next restart
-        self.vllm_profile = None             # persisted vLLM launcher profile, applied by the next restart
+        self.context_profile = None          # persisted context profile, applied by the next restart
         self.backend_error = None            # why the chosen backend is not the running one
         self._load_settings()
         self._conn_lock = threading.Lock()
@@ -5112,7 +5214,8 @@ class APIServer(ThreadingHTTPServer):
             self.prepend_system_prompt = enabled
             backend = canonical_backend(saved.get("backend"))
             self.backend_next = backend if backend in BACKEND_IDS else None
-            self.vllm_profile = saved.get("vllm_profile") if saved.get("vllm_profile") in VLLM_PROFILES else None
+            profile = context_profile_from(saved)
+            self.context_profile = profile if profile in CONTEXT_PROFILES else None
             if isinstance(saved.get("api_defaults"), dict):
                 try:
                     self.api_defaults = {k: v for k, v in validate_api_defaults(saved["api_defaults"]).items()
@@ -5134,11 +5237,13 @@ class APIServer(ThreadingHTTPServer):
                 "backend": self.backend_id,
                 "backend_next": self.backend_next or self.backend_id,
                 "backends": available_backends(),
-                "vllm_profile": self.vllm_profile or "long",
-                "backend_locked": "vllm" if self.vllm_profile == "fast" else None,
-                "vllm_profile_active": (self.engine.backend.get("profile")
-                                        if self.engine is not None and self.backend_id == "vllm" else None),
-                "vllm_profiles": {k: {"context": v["context"], "note": v["note"]} for k, v in VLLM_PROFILES.items()},
+                "context_profile": self.context_profile or DEFAULT_CONTEXT_PROFILE,
+                "backend_locked": CONTEXT_PROFILES.get(self.context_profile, {}).get("backend"),
+                "context_profile_active": (getattr(self.engine, "backend", None) or {}).get("profile")
+                                          if self.engine is not None else None,
+                "context_profiles": {k: {"context": v["context"], "note": v["note"], "backend": v["backend"],
+                                         "label": v.get("label") or k}
+                                     for k, v in available_context_profiles().items()},
                 "api_defaults": dict(self.api_defaults),
                 **({"backend_error": self.backend_error} if self.backend_error else {}),
             }
@@ -5146,7 +5251,8 @@ class APIServer(ThreadingHTTPServer):
     def update_settings(self, body):
         if not body:
             raise APIError(400, "At least one server setting is required.")
-        unknown = set(body) - {"system_prompt", "prepend_system_prompt", "backend", "api_defaults", "vllm_profile"}
+        unknown = set(body) - {"system_prompt", "prepend_system_prompt", "backend", "api_defaults",
+                               "context_profile", "vllm_profile"}
         if unknown:
             raise APIError(400, f"Unsupported setting: {sorted(unknown)[0]}",
                            sorted(unknown)[0], "unsupported_parameter")
@@ -5166,22 +5272,26 @@ class APIServer(ThreadingHTTPServer):
                 raise APIError(400, f"`backend` must be one of {', '.join(available_backends())}; "
                                     "the choice is explicit and applies after a restart.",
                                "backend", "invalid_value")
-            vllm_profile = body.get("vllm_profile", self.vllm_profile)
-            if vllm_profile is not None and vllm_profile not in VLLM_PROFILES:
-                raise APIError(400, f"`vllm_profile` must be one of {', '.join(VLLM_PROFILES)}; "
-                                    "it applies to the vLLM backend at its next start.",
-                               "vllm_profile", "invalid_value")
-            if vllm_profile == "fast":
-                # the 64K profile is only meaningful on vLLM: selecting it moves the next
-                # backend to vLLM and holds it there until `long` is selected again
-                if "vllm" not in available_backends():
-                    raise APIError(400, "`vllm_profile` fast needs the vLLM backend configured.",
-                                   "vllm_profile", "invalid_value")
-                if "backend" in body and backend != "vllm":
-                    raise APIError(400, "`backend` is locked to vllm while the fast vLLM profile is "
-                                        "selected; choose the long profile first.",
+            context_profile = self.context_profile
+            if "context_profile" in body or "vllm_profile" in body:
+                named = "context_profile" if "context_profile" in body else "vllm_profile"
+                context_profile = context_profile_from(body)
+                if context_profile not in CONTEXT_PROFILES:
+                    raise APIError(400, f"`context_profile` must be one of {', '.join(CONTEXT_PROFILES)}; "
+                                        "it applies at the next restart.", named, "invalid_value")
+            locked = CONTEXT_PROFILES.get(context_profile, {}).get("backend")
+            if locked:
+                # a profile only one backend serves moves the next backend there
+                # and holds it until `standard` is selected again
+                if locked not in available_backends():
+                    raise APIError(400, f"`context_profile` {context_profile} needs the "
+                                        f"{BACKEND_LABELS[locked]} backend configured.",
+                                   "context_profile", "invalid_value")
+                if "backend" in body and backend != locked:
+                    raise APIError(400, f"`backend` is locked to {locked} while the {context_profile} "
+                                        "context profile is selected; choose the standard profile first.",
                                    "backend", "invalid_value")
-                backend = "vllm"
+                backend = locked
             api_defaults = dict(self.api_defaults)
             if "api_defaults" in body:
                 for key, value in validate_api_defaults(body["api_defaults"]).items():
@@ -5198,7 +5308,7 @@ class APIServer(ThreadingHTTPServer):
                         "prepend_system_prompt": enabled,
                         "backend": backend,
                         "api_defaults": api_defaults,
-                        **({"vllm_profile": vllm_profile} if vllm_profile else {}),
+                        **({"context_profile": context_profile} if context_profile else {}),
                     }, ensure_ascii=False), encoding="utf-8")
                     temporary.chmod(0o600)
                     os.replace(temporary, self.settings_file)
@@ -5209,7 +5319,7 @@ class APIServer(ThreadingHTTPServer):
             self.system_prompt = prompt
             self.prepend_system_prompt = enabled
             self.backend_next = backend
-            self.vllm_profile = vllm_profile
+            self.context_profile = context_profile
             self.api_defaults = api_defaults
         return self.settings_payload()
 
@@ -5510,8 +5620,15 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def check_model(self, body):
         model = body.get("model")
-        if model != self.server.model_id:
-            raise APIError(404, f"The model `{model}` does not exist.", "model", "model_not_found")
+        if model == self.server.model_id:
+            return
+        # COLI_MODEL_ALIASES: comma-separated glob patterns accepted as aliases of
+        # the served model (e.g. "claude-*" for Claude Code, which sends Claude
+        # model names).  Default empty: every other id is refused as before.
+        aliases = [p.strip() for p in os.environ.get("COLI_MODEL_ALIASES", "").split(",") if p.strip()]
+        if isinstance(model, str) and any(fnmatch.fnmatchcase(model, p) for p in aliases):
+            return
+        raise APIError(404, f"The model `{model}` does not exist.", "model", "model_not_found")
 
     # The dashboard ships in two layouts and the old single path only knew one:
     # a source checkout puts this file in c/ (so web/dist is one level UP), while
@@ -5665,13 +5782,26 @@ class APIHandler(BaseHTTPRequestHandler):
             if path == "/v1/models":
                 # `models` duplicates `data`: Codex's model-list refresh reads that field
                 # (its own backend's shape) and logs an error without it.
-                entry = model_object(self.server.model_id, self.server.created)
-                self.send_json(200, {"object": "list", "data": [entry], "models": [entry]}, request_id)
+                runtime = (getattr(self.server.engine, "backend", None) or {}).get("model") if self.server.engine else None
+                window = self.server.context_window
+                entries = [model_object(self.server.model_id, self.server.created, context_window=window)]
+                entries += [model_object(m, self.server.created, f"{runtime or self.server.model_id} (AI-DER, as {m})",
+                                         window)
+                            for m in advertised_model_ids() if m != self.server.model_id]
+                # Anthropic list shape too: has_more / first_id / last_id
+                self.send_json(200, {"object": "list", "data": entries, "models": entries,
+                                     "has_more": False, "first_id": entries[0]["id"],
+                                     "last_id": entries[-1]["id"]}, request_id)
             elif path == "/v1/settings":
                 self.send_json(200, self.server.settings_payload(), request_id,
                                {"Cache-Control": "no-store"})
             elif path.startswith("/v1/models/") and unquote(path[11:]) == self.server.model_id:
-                self.send_json(200, model_object(self.server.model_id, self.server.created), request_id)
+                self.send_json(200, model_object(self.server.model_id, self.server.created,
+                                                 context_window=self.server.context_window), request_id)
+            elif path.startswith("/v1/models/") and unquote(path[11:]) in advertised_model_ids():
+                self.send_json(200, model_object(unquote(path[11:]), self.server.created,
+                                                 f"{self.server.model_id} (AI-DER)",
+                                                 self.server.context_window), request_id)
             else:
                 raise APIError(404, "Not found.", None, "not_found")
         except APIError as error:
@@ -5777,6 +5907,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.completion(body, request_id)
             elif path == "/v1/messages":
                 self.anthropic_messages(body, request_id)
+            elif path == "/v1/messages/count_tokens":
+                self.anthropic_count_tokens(body, request_id)
             elif path == "/v1/responses":
                 self.openai_responses(body, request_id)
             else:
@@ -5807,7 +5939,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def error_body(self, error):
         """Anthropic clients parse a different error envelope; the OpenAI one is unchanged."""
-        if urlsplit(self.path).path != "/v1/messages":
+        if not urlsplit(self.path).path.startswith("/v1/messages"):
             return error_object(error)
         return {"type": "error", "error": {"type": error.error_type, "message": error.message}}
 
@@ -6297,6 +6429,44 @@ class APIHandler(BaseHTTPRequestHandler):
     # ---- Anthropic /v1/messages (#343) ----------------------------------------------------
     ANTHROPIC_STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
 
+    # Anthropic's /v1/messages/count_tokens: the prompt is rendered exactly as
+    # /v1/messages would render it (same template, tools, thinking); the proxy
+    # backends count it with their own tokenizer, the AI-DER engine has no
+    # tokenizer in the gateway, so there it is an estimate (~3.5 characters per
+    # token; English prose measures 4.0, code and JSON less, so it errs high).
+    # Images count COUNT_TOKENS_PER_IMAGE each.
+    COUNT_TOKENS_PER_IMAGE = 1024
+
+    def anthropic_count_tokens(self, body, request_id):
+        messages = anthropic_to_openai(body)
+        tools, tool_choice = anthropic_tools(body)
+        thinking = body.get("thinking")
+        enable_thinking = bool(isinstance(thinking, dict) and thinking.get("type") == "enabled")
+        images = 0
+        text_messages = []
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, list):
+                kept = [p for p in content if not (isinstance(p, dict) and p.get("type") in ("image_url", "input_image"))]
+                images += len(content) - len(kept)
+                message = dict(message, content=kept)
+            text_messages.append(message)
+        defaults = self.server.api_defaults
+        effort = defaults.get("reasoning_effort", "xhigh") if enable_thinking else None
+        prompt = render_chat_for_arch(text_messages, enable_thinking, effort,
+                                      None if tool_choice == "none" else tools, tool_choice,
+                                      preserve_thinking=defaults.get("preserve_thinking", False))
+        count, exact = None, False
+        engine = self.server.engine
+        if isinstance(engine, ProxyEngine):
+            count = engine._count_tokens(prompt)
+            exact = count is not None
+        if count is None:
+            count = math.ceil(len(prompt) / 3.5)
+        count += images * self.COUNT_TOKENS_PER_IMAGE
+        self.send_json(200, {"input_tokens": count}, request_id,
+                       {"Cache-Control": "no-store", "X-Token-Count": "exact" if exact else "estimate"})
+
     def anthropic_messages(self, body, request_id):
         for unsupported, why in (("stop_sequences", "custom stop sequences"),
                                  ("top_k", "top-k sampling")):
@@ -6603,7 +6773,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 index += 1
             send_event("message_delta", {"type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                "usage": {"output_tokens": stats["completion_tokens"]}})
+                # input_tokens here too (the API sends cumulative usage in
+                # message_delta): message_start goes out before the prompt is
+                # counted, and Claude Code tracks its context from this value
+                "usage": {"input_tokens": int(stats.get("prompt_tokens") or 0),
+                          "output_tokens": stats["completion_tokens"]}})
             send_event("message_stop", {"type": "message_stop"})
             # close_connection was already set when the 200 was committed (#597 item 3).
 
@@ -7052,10 +7226,11 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
                              f"{family.limits.max_kv_slots} KV slot(s)")
         if backend != "aider":
             try:
-                profile = saved_vllm_profile(os.environ.get("COLI_SETTINGS_FILE"))
+                profile = saved_context_profile(os.environ.get("COLI_SETTINGS_FILE"))
                 proxy_env = dict(env or os.environ)
-                if backend == "vllm" and profile:
-                    proxy_env["COLI_VLLM_PROFILE"] = profile
+                if profile:
+                    proxy_env["COLI_CONTEXT_PROFILE"] = profile
+                    proxy_env.pop("COLI_VLLM_PROFILE", None)
                 runtime = ProxyEngine(backend, model_id, max_tokens, proxy_env, kv_slots, family)
             except Exception as error:
                 # a backend that cannot start must not take the service down

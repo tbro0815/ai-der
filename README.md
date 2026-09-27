@@ -1,4 +1,4 @@
-# AI-DER 1.2.1
+# AI-DER 1.3.0
 
 **Artificial Intelligence Distributed Engram Runner** is a local inference runner
 for Qwen3.8-Flash-Next quantized mixture-of-experts models. It combines SSD-backed
@@ -36,7 +36,7 @@ sudo apt-get update
 sudo apt-get install -y git
 git clone https://github.com/tbro0815/ai-der.git
 cd ai-der
-git checkout v1.2.1
+git checkout v1.3.0
 ./install.sh --check
 ./install.sh
 ```
@@ -82,7 +82,9 @@ set -a; source ai-der.env; set +a
 Open `http://127.0.0.1:8080` in a browser for the dashboard; the API base URL is
 `http://127.0.0.1:8080/v1`. The default backend is AI-DER; the Extra section of
 the dashboard switches to llama.cpp or vLLM at the next restart and selects the
-vLLM profile (`long`, 131K, or `fast`, 64K, which locks the backend to vLLM).
+context profile: `standard` (131K, every backend), `fast` (80K, vLLM only),
+`vllm-190k` (190K, vLLM only) or `long` (262K, llama.cpp only). A profile served
+by one backend locks the backend to it until `standard` is selected again.
 With `--systemd`: `systemctl --user enable --now ai-der.service`.
 
 **Web search in the chat.** Enter a [Serper](https://serper.dev) API key in the
@@ -120,7 +122,7 @@ Qwen repository and `engine/c/convert_mtp.py` writes `<container>/mtp`.
 Python package metadata and `ai-der --version` (`coli` remains an alias).
 Use semantic versioning: MAJOR for incompatible changes, MINOR for compatible
 features, PATCH for fixes. Releases are tagged `vMAJOR.MINOR.PATCH`; this release
-is **v1.2.1**. Internal upstream component metadata is independent.
+is **v1.3.0**. Internal upstream component metadata is independent.
 
 ```bash
 .venv/bin/ai-der --version

@@ -18,7 +18,7 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import openai_server
 from openai_server import (_coerce_arg, ProxyImages, collect_proxy_images, proxy_chat_messages, anthropic_to_openai, _native_tool_call, APIError, APIHandler, APIServer, ClientCancelled, ProxyEngine,
-                           backend_model_id, resolve_backend, saved_backend, saved_vllm_profile,
+                           backend_model_id, resolve_backend, saved_backend, saved_context_profile,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
                            _engine_error, cap_for_arch, conversation_cache_slot, model_arch,
@@ -1433,6 +1433,53 @@ class HTTPTest(unittest.TestCase):
             self.request("/v1/models", key="wrong")
         self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 401)
+
+    def test_model_aliases_and_anthropic_count_tokens(self):
+        body = {"model": "claude-opus-5-5", "max_tokens": 8,
+                "messages": [{"role": "user", "content": "Hello there, how are you today?"}]}
+        with self.assertRaises(HTTPError) as caught:           # strict by default
+            self.request("/v1/messages/count_tokens", body)
+        self.addCleanup(caught.exception.close)
+        self.assertEqual(caught.exception.code, 404)
+        self.assertEqual(json.load(caught.exception)["type"], "error")   # Anthropic envelope
+        with patch.dict("os.environ", {"COLI_MODEL_ALIASES": "claude-*, other-model"}):
+            with self.request("/v1/messages/count_tokens", body) as response:
+                self.assertEqual(response.headers["X-Token-Count"], "estimate")
+                counted = json.load(response)["input_tokens"]
+            self.assertGreater(counted, 5)
+            self.assertLess(counted, 200)
+            with_tools = dict(body, tools=[{"name": "read_file", "description": "Read a file",
+                                            "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}}])
+            with self.request("/v1/messages/count_tokens", with_tools) as response:
+                self.assertGreater(json.load(response)["input_tokens"], counted)
+            with self.request("/v1/chat/completions", {"model": "other-model", "max_tokens": 4,
+                                                        "messages": [{"role": "user", "content": "Hi"}]}) as response:
+                self.assertEqual(response.status, 200)
+            with self.assertRaises(HTTPError) as caught:
+                self.request("/v1/chat/completions", {"model": "gpt-4", "max_tokens": 4,
+                                                      "messages": [{"role": "user", "content": "Hi"}]})
+            self.addCleanup(caught.exception.close)
+            self.assertEqual(caught.exception.code, 404)
+
+    def test_models_list_advertises_claude_aliases_in_both_shapes(self):
+        with patch.dict("os.environ", {"COLI_ADVERTISED_MODELS": "claude-opus-5-5, claude-sonnet-5"}):
+            with self.request("/v1/models?limit=1000") as response:
+                listing = json.load(response)
+            with self.request("/v1/models/claude-sonnet-5") as response:
+                single = json.load(response)
+        ids = [m["id"] for m in listing["data"]]
+        self.assertEqual(ids, ["test-model", "claude-opus-5-5", "claude-sonnet-5"])
+        self.assertEqual((listing["first_id"], listing["last_id"], listing["has_more"]),
+                         ("test-model", "claude-sonnet-5", False))
+        for m in listing["data"]:
+            self.assertEqual((m["object"], m["type"]), ("model", "model"))
+            self.assertTrue(m["created_at"].endswith("Z"))
+        self.assertEqual(single["id"], "claude-sonnet-5")
+        # every entry reports the served window under the common field names
+        window = self.server.context_window
+        for m in listing["data"] + [single]:
+            self.assertEqual((m["context_length"], m["max_model_len"], m["max_input_tokens"]),
+                             (window, window, window))
 
     def test_health_reports_scheduler_and_kv_slots(self):
         with self.request("/health") as response:
@@ -3301,24 +3348,24 @@ class ProxyEngineTest(unittest.TestCase):
         prefix = prompt[:prompt.index("<|im_start|>user\n")]
         engine = self.engine()
         engine.generate(prompt, 8, 0.0, 0.9, lambda _: None, cache_slot=1)
-        paths = [p for p, _ in _UpstreamHandler.seen]
+        paths = [p for p, _ in _UpstreamHandler.seen if p != "/tokenize"]
         self.assertEqual(paths, ["/v1/completions", "/slots/1?action=save", "/v1/completions"])
-        self.assertEqual(_UpstreamHandler.seen[0][1]["prompt"], prefix)
-        self.assertEqual(_UpstreamHandler.seen[0][1]["max_tokens"], 1)
-        filename = _UpstreamHandler.seen[1][1]["filename"]
+        self.assertEqual([b for p, b in _UpstreamHandler.seen if p != "/tokenize"][0]["prompt"], prefix)
+        self.assertEqual([b for p, b in _UpstreamHandler.seen if p != "/tokenize"][0]["max_tokens"], 1)
+        filename = [b for p, b in _UpstreamHandler.seen if p != "/tokenize"][1]["filename"]
         self.assertTrue(filename.startswith("prefix-"))
         # same prefix again in the same slot: nothing extra
         engine.generate(prompt + "x", 8, 0.0, 0.9, lambda _: None, cache_slot=1)
-        self.assertEqual([p for p, _ in _UpstreamHandler.seen][3:], ["/v1/completions"])
+        self.assertEqual([p for p, _ in _UpstreamHandler.seen if p != "/tokenize"][3:], ["/v1/completions"])
         engine.close()
         # a fresh engine (restart) finds the file and restores instead of re-prefilling
         Path(self.slots.name, filename).write_bytes(b"state")
         _UpstreamHandler.seen = []
         second = self.engine()
         second.generate(prompt, 8, 0.0, 0.9, lambda _: None, cache_slot=1)
-        self.assertEqual([p for p, _ in _UpstreamHandler.seen],
+        self.assertEqual([p for p, _ in _UpstreamHandler.seen if p != "/tokenize"],
                          ["/slots/1?action=restore", "/v1/completions"])
-        self.assertEqual(_UpstreamHandler.seen[0][1]["filename"], filename)
+        self.assertEqual([b for p, b in _UpstreamHandler.seen if p != "/tokenize"][0]["filename"], filename)
         finished = [e for e in second.telemetry_snapshot()["events"] if e["event"] == "prefill_finished"][0]
         self.assertGreaterEqual(finished["cached_tokens"], 5)
         second.close()
@@ -3414,6 +3461,19 @@ class ProxyEngineTest(unittest.TestCase):
         self.assertEqual(len([b for p, b in _UpstreamHandler.seen if p == "/v1/completions"]), 0)
         engine.close()
 
+    def test_output_is_clamped_to_the_window(self):
+        engine = self.engine()
+        engine.context_window = 100
+        with patch.object(engine, "_count_tokens", return_value=60):
+            engine.generate("Hi", 32768, 0.0, 0.9, lambda _: None)
+        body = [b for p, b in _UpstreamHandler.seen if p == "/v1/completions"][-1]
+        self.assertEqual(body["max_tokens"], 100 - 60 - 16)
+        with patch.object(engine, "_count_tokens", return_value=95):
+            with self.assertRaises(APIError) as caught:
+                engine.generate("Hi", 10, 0.0, 0.9, lambda _: None)
+        self.assertEqual(caught.exception.code, "context_length_exceeded")
+        engine.close()
+
     def test_reset_cache_erases_the_llama_slot(self):
         engine = self.engine()
         engine.reset_cache(1)
@@ -3500,47 +3560,107 @@ class BackendSelectionTest(unittest.TestCase):
         self.assertFalse(engine.supports_cache_reset)
         engine.close()
 
-    def test_vllm_profile_setting_overrides_the_launcher_environment(self):
+    def test_context_profiles_override_the_backend_launch(self):
         env = {"COLI_VLLM_CMD": "/bin/bash /srv/start_qwen.sh", "COLI_VLLM_MODEL": "/srv/models/q27",
                "COLI_VLLM_ENV": "PORT=8082 HOST=127.0.0.1 CTX=long MAX_LEN=131072 PREFIX_CACHE=1",
                "COLI_VLLM_CONTEXT": "131072"}
         with patch("openai_server.ARCH", "qwen38"):
-            long = ProxyEngine("vllm", "qwen3.8-flash-next-aider", env=env, spawn=False)
+            standard = ProxyEngine("vllm", "qwen3.8-flash-next-aider", env=env, spawn=False)
             fast = ProxyEngine("vllm", "qwen3.8-flash-next-aider",
-                               env=dict(env, COLI_VLLM_PROFILE="fast"), spawn=False)
-        self.assertEqual((long.child_env["CTX"], long.context_window, long.backend["profile"]), ("long", 131072, "long"))
+                               env=dict(env, COLI_CONTEXT_PROFILE="fast"), spawn=False)
+            legacy = ProxyEngine("vllm", "qwen3.8-flash-next-aider",
+                                 env=dict(env, COLI_VLLM_PROFILE="long"), spawn=False)
+        self.assertEqual((standard.child_env["CTX"], standard.context_window, standard.backend["profile"]),
+                         ("long", 131072, "standard"))
         self.assertEqual((fast.child_env["CTX"], fast.child_env["MAX_LEN"], fast.context_window,
-                          fast.backend["profile"]), ("fast", "65536", 65536, "fast"))
-        long.close(); fast.close()
+                          fast.backend["profile"]), ("fast", "81920", 81920, "fast"))
+        self.assertEqual((legacy.context_window, legacy.backend["profile"]), (131072, "standard"))
+        with patch("openai_server.ARCH", "qwen38"):
+            wide = ProxyEngine("vllm", "qwen3.8-flash-next-aider",
+                               env=dict(env, COLI_CONTEXT_PROFILE="vllm-190k"), spawn=False)
+        # the standard fp8 launch with the larger MAX_LEN
+        self.assertEqual((wide.child_env["CTX"], wide.child_env["MAX_LEN"], wide.context_window,
+                          wide.backend["context_window"], wide.backend["profile"]),
+                         ("long", "190464", 190464, 190464, "vllm-190k"))
+        standard.close(); fast.close(); legacy.close(); wide.close()
+        # llama.cpp: `long` raises -c to the native 262K and pins the q8_0 KV cache
+        lenv = {"COLI_LLAMACPP_MODEL": "/models/x.gguf", "COLI_LLAMACPP_PORT": "18081",
+                "COLI_LLAMACPP_ARGS": "-c 131072 -fa on --fit-target 256"}
+        with patch("openai_server.ARCH", "qwen38"):
+            plain = ProxyEngine("llamacpp", "qwen3.8-flash-next-aider", env=lenv, spawn=False)
+            long = ProxyEngine("llamacpp", "qwen3.8-flash-next-aider",
+                               env=dict(lenv, COLI_CONTEXT_PROFILE="long"), spawn=False)
+        self.assertEqual((plain.context_window, plain.backend["profile"]), (131072, "standard"))
+        self.assertEqual((long.context_window, long.backend["profile"]), (262144, "long"))
+        command = long.command
+        self.assertEqual(command[command.index("-c") + 1], "262144")
+        self.assertEqual(command.count("-c"), 1)
+        self.assertEqual(command[command.index("-ctk") + 1], "q8_0")
+        self.assertEqual(command[command.index("-ctv") + 1], "q8_0")
+        self.assertIn("--fit-target", command)
+        plain.close(); long.close()
+
+    def test_context_profile_setting_locks_the_backend(self):
         with tempfile.TemporaryDirectory() as tmp, \
-             patch.dict("os.environ", {"COLI_VLLM_CMD": "/bin/bash /srv/start_qwen.sh"}):
+             patch.dict("os.environ", {"COLI_VLLM_CMD": "/bin/bash /srv/start_qwen.sh",
+                                       "COLI_LLAMACPP_MODEL": "/models/x.gguf"}):
             path = Path(tmp) / "settings.json"
             server = APIServer(("127.0.0.1", 0), FakeEngine(), "test-model", settings_file=path)
             try:
-                self.assertEqual(server.settings_payload()["vllm_profile"], "long")
-                self.assertEqual(server.settings_payload()["vllm_profiles"]["fast"]["context"], 65536)
-                payload = server.update_settings({"vllm_profile": "fast"})
-                self.assertEqual(payload["vllm_profile"], "fast")
-                self.assertIsNone(payload["vllm_profile_active"])          # AI-DER is serving
-                # fast locks the next backend to vLLM until long is selected again
+                first = server.settings_payload()
+                self.assertEqual(first["context_profile"], "standard")
+                self.assertEqual({k: (v["context"], v["backend"]) for k, v in first["context_profiles"].items()},
+                                 {"fast": (81920, "vllm"), "standard": (131072, None),
+                                  "long": (262144, "llamacpp"), "vllm-190k": (190464, "vllm")})
+                self.assertEqual(first["context_profiles"]["vllm-190k"]["label"], "vLLM 190K")
+                payload = server.update_settings({"context_profile": "vllm-190k"})
+                self.assertEqual((payload["backend_next"], payload["backend_locked"]), ("vllm", "vllm"))
+                payload = server.update_settings({"context_profile": "fast"})
+                self.assertEqual(payload["context_profile"], "fast")
+                # fast locks the next backend to vLLM until standard is selected again
                 self.assertEqual((payload["backend_next"], payload["backend_locked"]), ("vllm", "vllm"))
                 with self.assertRaises(APIError):
                     server.update_settings({"backend": "aider"})
                 self.assertEqual(resolve_backend(None, path), "vllm")
-                unlocked = server.update_settings({"vllm_profile": "long"})
+                # long moves the lock to llama.cpp
+                payload = server.update_settings({"context_profile": "long"})
+                self.assertEqual((payload["context_profile"], payload["backend_next"], payload["backend_locked"]),
+                                 ("long", "llamacpp", "llamacpp"))
+                with self.assertRaises(APIError):
+                    server.update_settings({"backend": "vllm"})
+                self.assertEqual(resolve_backend(None, path), "llamacpp")
+                unlocked = server.update_settings({"context_profile": "standard"})
                 self.assertIsNone(unlocked["backend_locked"])
                 self.assertEqual(server.update_settings({"backend": "aider"})["backend_next"], "aider")
-                server.update_settings({"vllm_profile": "fast"})
+                # clients from before the rename: vllm_profile long meant today's standard
+                self.assertEqual(server.update_settings({"vllm_profile": "long"})["context_profile"], "standard")
+                self.assertEqual(server.update_settings({"vllm_profile": "fast"})["context_profile"], "fast")
                 with self.assertRaises(APIError):
-                    server.update_settings({"vllm_profile": "huge"})
+                    server.update_settings({"context_profile": "huge"})
             finally:
                 server.scheduler.close(); server.server_close()
-            self.assertEqual(saved_vllm_profile(path), "fast")
+            self.assertEqual(saved_context_profile(path), "fast")
             second = APIServer(("127.0.0.1", 0), FakeEngine(), "test-model", settings_file=path)
             try:
-                self.assertEqual(second.settings_payload()["vllm_profile"], "fast")
+                self.assertEqual(second.settings_payload()["context_profile"], "fast")
             finally:
                 second.scheduler.close(); second.server_close()
+            # a settings file written before the rename
+            path.write_text(json.dumps({"system_prompt": "", "prepend_system_prompt": False,
+                                        "backend": "vllm", "vllm_profile": "long"}))
+            self.assertEqual(saved_context_profile(path), "standard")
+        # a profile whose backend is not configured is neither listed nor selectable
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.dict("os.environ", {"COLI_VLLM_CMD": "/bin/bash /srv/start_qwen.sh"}):
+            os.environ.pop("COLI_LLAMACPP_MODEL", None)
+            server = APIServer(("127.0.0.1", 0), FakeEngine(), "test-model",
+                               settings_file=Path(tmp) / "settings.json")
+            try:
+                self.assertEqual(sorted(server.settings_payload()["context_profiles"]), ["fast", "standard", "vllm-190k"])
+                with self.assertRaises(APIError):
+                    server.update_settings({"context_profile": "long"})
+            finally:
+                server.scheduler.close(); server.server_close()
 
     def test_backend_setting_persists_for_the_next_restart(self):
         with tempfile.TemporaryDirectory() as tmp, \
