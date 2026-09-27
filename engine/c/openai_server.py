@@ -85,6 +85,10 @@ class APIError(Exception):
         self.headers = headers or {}
 
 
+class UpstreamStalled(RuntimeError):
+    """A proxy backend's stream made no progress within its stall deadline."""
+
+
 class ClientCancelled(Exception):
     pass
 
@@ -2021,7 +2025,21 @@ def proxy_chat_messages(messages, max_images):
     data URIs (the upstream never fetches on the gateway's behalf), images in
     tool results move into a user message that follows the tool result (chat
     templates render tool content as text), and only the newest `max_images`
-    stay (the upstream's per-prompt limit); older ones become a note."""
+    stay (the upstream's per-prompt limit); older ones become a note.  The
+    leading system/developer run is merged into one system message the way the
+    gateway's renderer does it: the upstream's template takes a single system
+    message at the start and refuses the dashboard's prepended prompt followed
+    by the client's own ("System message must be at the beginning")."""
+    leading, merged = 0, []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") not in ("system", "developer"):
+            break
+        text = content_text(message.get("content") or "", f"messages.{leading}.content").strip()
+        if text:
+            merged.append(text)
+        leading += 1
+    if leading > 1 or (leading == 1 and messages[0].get("role") != "system"):
+        messages = ([{"role": "system", "content": "\n".join(merged)}] if merged else []) + list(messages[leading:])
     located = []                       # (message index, part index)
     for index, message in enumerate(messages):
         content = message.get("content") if isinstance(message, dict) else None
@@ -4452,19 +4470,73 @@ class ProxyEngine(Engine):
         self.process = None
         self._win_job = None
         self.hwinfo = _host_hwinfo()
+        # Stall guard: an upstream stream that shows no progress within its
+        # deadline is aborted and the upstream restarted (a vLLM engine core
+        # once sat on an image turn with the GPU idle, holding the queue until
+        # a manual restart).  Before the first token the deadline is
+        # COLI_STALL_BASE + prompt tokens / COLI_STALL_PREFILL_RATE (a floor
+        # well below the measured prefill rate); between chunks COLI_STALL_IDLE.
+        # COLI_STALL_BASE=0 turns the guard off.
+        self.stall_base = float(environ.get("COLI_STALL_BASE", "180"))
+        self.stall_idle = float(environ.get("COLI_STALL_IDLE", "180"))
+        self.stall_rate = float(environ.get("COLI_STALL_PREFILL_RATE",
+                                            str(self.STALL_PREFILL_RATE.get(backend, 100))))
+        self.start_timeout = float(environ.get("COLI_BACKEND_START_TIMEOUT", "900"))
+        self.ready = threading.Event()        # cleared while the upstream restarts
+        self.ready.set()
+        self.restart_lock = threading.Lock()
+        self.stalls = 0
         if spawn:
             print(f"[api] backend {backend}: {' '.join(shlex.quote(c) for c in cmd)}", file=sys.stderr)
-            # own session: close() signals the whole group (vLLM keeps its
-            # engine core in a child process that must release the GPU before
-            # the next backend starts)
-            self.process = subprocess.Popen(cmd, env=environ, stdin=subprocess.DEVNULL,
-                                            stdout=sys.stderr, stderr=subprocess.STDOUT,
-                                            start_new_session=True)
-            self._wait_ready(float(environ.get("COLI_BACKEND_START_TIMEOUT", "900")))
-            if backend == "vllm":
-                self.warm_prefixes()
+            self._start_process()
+
+    # prefill-rate floors for the stall deadline (tok/s; measured cold: vLLM
+    # 680 at 188K and 1,450 at 3K, llama.cpp 176 at 261K)
+    STALL_PREFILL_RATE = {"vllm": 300, "llamacpp": 100}
 
     # -- lifecycle -----------------------------------------------------------
+    def _start_process(self):
+        # own session: close() signals the whole group (vLLM keeps its
+        # engine core in a child process that must release the GPU before
+        # the next backend starts)
+        self.process = subprocess.Popen(self.command, env=self.child_env, stdin=subprocess.DEVNULL,
+                                        stdout=sys.stderr, stderr=subprocess.STDOUT,
+                                        start_new_session=True)
+        self._wait_ready(self.start_timeout)
+        if self.backend_id == "vllm":
+            self.warm_prefixes()
+
+    def restart_upstream(self, reason):
+        """Stop and start the upstream in the background; generate() waits on
+        `ready` meanwhile, so queued requests run on the fresh upstream."""
+        with self.restart_lock:
+            if not self.ready.is_set() or self.closed:
+                return False
+            self.ready.clear()
+            self.backend["restarting"] = True
+
+        def run():
+            started = time.monotonic()
+            try:
+                print(f"[stall] restarting {self.backend['label']}: {reason}", file=sys.stderr)
+                self._stop_process()
+                if not self.closed:
+                    self._start_process()
+                    print(f"[stall] {self.backend['label']} back after "
+                          f"{time.monotonic() - started:.0f} s", file=sys.stderr)
+            except Exception as error:
+                print(f"[stall] {self.backend['label']} restart failed: {error}", file=sys.stderr)
+            finally:
+                self.backend.pop("restarting", None)
+                self.ready.set()
+
+        threading.Thread(target=run, name=f"{self.backend_id}-restart", daemon=True).start()
+        return True
+
+    def stall_deadline(self, prompt_tokens):
+        """Seconds allowed before the first streamed token."""
+        return self.stall_base + max(int(prompt_tokens or 0), 0) / max(self.stall_rate, 1.0)
+
     def _wait_ready(self, timeout):
         deadline = time.monotonic() + timeout
         while True:
@@ -4486,7 +4558,11 @@ class ProxyEngine(Engine):
             time.sleep(1.0)
 
     def is_alive(self):
-        return not self.closed and self.process is not None and self.process.poll() is None
+        if self.closed:
+            return False
+        if not self.ready.is_set():           # a stall restart is under way
+            return True
+        return self.process is not None and self.process.poll() is None
 
     def close(self):
         with self.pending_lock:
@@ -4494,6 +4570,9 @@ class ProxyEngine(Engine):
                 return
             self.closed = True
         self._fail_pending(RuntimeError("backend is shutting down"))
+        self._stop_process()
+
+    def _stop_process(self):
         if self.process is None or self.process.poll() is not None:
             return
         pgid = None
@@ -4705,6 +4784,14 @@ class ProxyEngine(Engine):
         payload = prompt.encode("utf-8")
         if b"\0" in payload:
             raise APIError(400, "NUL bytes are not supported in prompts.", "messages")
+        # a stall restart in progress: wait for the fresh upstream
+        waited = time.monotonic()
+        while not self.ready.wait(1.0):
+            if cancelled and cancelled():
+                raise ClientCancelled()
+            if time.monotonic() - waited > self.start_timeout + 120:
+                raise RuntimeError(f"{self.backend['label']} did not come back from its restart")
+        counted = None
         # Clamp the output to the window like the native engine does: clients
         # such as Claude Code ask for a fixed 32K max_tokens, which together
         # with a long prompt exceeds the window and the upstream refuses the
@@ -4722,6 +4809,10 @@ class ProxyEngine(Engine):
                     print(f"[api] max_tokens {max_tokens} clamped to {room} (prompt {counted}, "
                           f"window {self.context_window})", file=sys.stderr)
                     max_tokens = room
+        # prompt size for the stall deadline: the upstream's count, else an
+        # estimate (3 characters per token, 2,048 per image: vLLM's pixel cap)
+        estimate = counted if counted is not None else (
+            len(prompt) // 3 + 2048 * len(media or ()))
         with self.pending_lock:
             if self.closed:
                 raise RuntimeError("backend is shutting down")
@@ -4765,13 +4856,26 @@ class ProxyEngine(Engine):
         def budget_stop():
             return state["cut"] or (stopped() if stopped else False)
 
-        if chat is not None:
-            first = self._chat_once(chat, max_tokens, temperature, top_p, on_text, cancelled,
-                                    budget_stop, on_accept)
-        else:
-            first = self._stream_once(prompt, max_tokens, temperature, top_p, cache_slot, grammar,
-                                      on_text_counted if think_open else on_text, cancelled,
-                                      budget_stop, on_accept, media=media)
+        def stalled(error):
+            self.stalls += 1
+            self._telemetry_request(request_id, remove=True)
+            self._record_telemetry("request_failed", request_id, error="STALLED")
+            print(f"[stall] {self.backend['label']}: {error}", file=sys.stderr)
+            self.restart_upstream(str(error))
+            return APIError(503, f"The {self.backend['label']} backend stopped making progress "
+                                 f"({error}) and is being restarted; retry the request in a "
+                                 "minute or two.", None, "backend_stalled", "server_error")
+
+        try:
+            if chat is not None:
+                first = self._chat_once(chat, max_tokens, temperature, top_p, on_text, cancelled,
+                                        budget_stop, on_accept, prompt_tokens=estimate)
+            else:
+                first = self._stream_once(prompt, max_tokens, temperature, top_p, cache_slot, grammar,
+                                          on_text_counted if think_open else on_text, cancelled,
+                                          budget_stop, on_accept, media=media, prompt_tokens=estimate)
+        except UpstreamStalled as error:
+            raise stalled(error) from None
         if first["cancel"]:
             self._telemetry_request(request_id, remove=True)
             self._record_telemetry("request_cancelled", request_id, error="CANCELLED")
@@ -4786,8 +4890,12 @@ class ProxyEngine(Engine):
             remaining = max_tokens - first["completion_tokens"]
             if remaining > 0:
                 prompt2 = prompt + "".join(state["text"]) + handover
-                second = self._stream_once(prompt2, remaining, temperature, top_p, cache_slot, grammar,
-                                           on_text, cancelled, stopped, media=media)
+                try:
+                    second = self._stream_once(prompt2, remaining, temperature, top_p, cache_slot, grammar,
+                                               on_text, cancelled, stopped, media=media,
+                                               prompt_tokens=estimate)
+                except UpstreamStalled as error:
+                    raise stalled(error) from None
                 if second["cancel"]:
                     self._telemetry_request(request_id, remove=True)
                     self._record_telemetry("request_cancelled", request_id, error="CANCELLED")
@@ -4857,7 +4965,7 @@ class ProxyEngine(Engine):
         return stats
 
     def _stream_once(self, prompt, max_tokens, temperature, top_p, cache_slot, grammar,
-                     on_text, cancelled, stopped, on_accept=None, media=None):
+                     on_text, cancelled, stopped, on_accept=None, media=None, prompt_tokens=None):
         """One streamed upstream completion.  Returns the counters generate()
         folds into its stats; raises the upstream's error.  `media` (P6.5,
         llama.cpp) are the encoded images behind the prompt's MTMD markers."""
@@ -4907,10 +5015,11 @@ class ProxyEngine(Engine):
                     out.append(("finish", "length" if value.get("stop_type") == "limit" else "stop"))
                 return out
 
-        return self._stream_upstream(path, body, pieces, on_text, cancelled, stopped, on_accept)
+        return self._stream_upstream(path, body, pieces, on_text, cancelled, stopped, on_accept,
+                                     prompt_tokens=prompt_tokens)
 
     def _chat_once(self, chat, max_tokens, temperature, top_p, on_text, cancelled, stopped,
-                   on_accept=None):
+                   on_accept=None, prompt_tokens=None):
         """P6.5, vLLM image turns: one streamed upstream chat completion whose
         deltas are re-serialized into the text the gateway's own splitter and
         tool-call parser expect (reasoning, `</think>`, content, native
@@ -4964,15 +5073,18 @@ class ProxyEngine(Engine):
             return out
 
         return self._stream_upstream("/v1/chat/completions", body, pieces, on_text, cancelled,
-                                     stopped, on_accept)
+                                     stopped, on_accept, prompt_tokens=prompt_tokens)
 
-    def _stream_upstream(self, path, body, pieces, on_text, cancelled, stopped, on_accept=None):
+    def _stream_upstream(self, path, body, pieces, on_text, cancelled, stopped, on_accept=None,
+                         prompt_tokens=None):
         events = queue.Queue()
         conn = self._connection()
+        sock = []                 # the stream's socket, shut down to unblock the reader
 
         def reader():
             try:
                 conn.request("POST", path, json.dumps(body), {"Content-Type": "application/json"})
+                sock.append(conn.sock)
                 response = conn.getresponse()
                 if response.status != 200:
                     events.put(("error", self._upstream_error(response.status, response.read())))
@@ -5002,6 +5114,10 @@ class ProxyEngine(Engine):
         timings = None
         finish_reason = None
         cancel = stop = False
+        guard = self.stall_base > 0
+        last_progress = time.monotonic()
+        limit = self.stall_deadline(prompt_tokens)
+        stall = None
         try:
             while True:
                 try:
@@ -5010,6 +5126,12 @@ class ProxyEngine(Engine):
                     if not cancel and cancelled and cancelled():
                         cancel = True
                         break
+                    if guard and time.monotonic() - last_progress > limit:
+                        waited = time.monotonic() - last_progress
+                        stall = UpstreamStalled(
+                            f"no {'first token' if first_token_at is None else 'output'} for "
+                            f"{waited:.0f} s (limit {limit:.0f} s, ~{int(prompt_tokens or 0)} prompt tokens)")
+                        break
                     continue
                 if kind == "accept":
                     if on_accept is not None:
@@ -5017,6 +5139,8 @@ class ProxyEngine(Engine):
                         on_accept = None
                     continue
                 elif kind == "data":
+                    last_progress = time.monotonic()
+                    limit = self.stall_idle
                     if on_accept is not None:
                         on_accept({"prompt_tokens": None})
                         on_accept = None
@@ -5043,8 +5167,18 @@ class ProxyEngine(Engine):
                 else:
                     raise value
         finally:
-            conn.close()          # a closed socket aborts the upstream slot on cancel/stop
+            # a closed socket aborts the upstream slot on cancel/stop; shutdown()
+            # also wakes a reader blocked on a silent upstream (close() alone
+            # does not interrupt its recv)
+            for s in sock:
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except (OSError, AttributeError):
+                    pass
+            conn.close()
             thread.join(timeout=5)
+        if stall is not None:
+            raise stall
         if isinstance(usage, dict) and not stop:
             completion_tokens = int(usage.get("completion_tokens", completion_tokens) or completion_tokens)
         seconds = None
@@ -5948,6 +6082,14 @@ class APIHandler(BaseHTTPRequestHandler):
         stream ends at the close, which the 200 already announced (#597 item 3)."""
         if self._committed:
             self.close_connection = True
+            # an OpenAI stream can still carry the error as its last event
+            # (a stalled backend: the client learns why instead of a cut)
+            if urlsplit(self.path).path in ("/v1/chat/completions", "/v1/completions"):
+                try:
+                    self.wfile.write(b"data: " + json.dumps(error_object(error)).encode() + b"\n\n")
+                    self.wfile.flush()
+                except OSError:
+                    pass
             return
         self.send_json(error.status, self.error_body(error), request_id, error.headers)
 

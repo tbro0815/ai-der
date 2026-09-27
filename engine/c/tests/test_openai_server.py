@@ -3125,6 +3125,17 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
             self.send_response(200); self.send_header("Content-Length", str(len(payload))); self.end_headers()
             self.wfile.write(payload)
             return
+        if script.get("hang") is not None and self.path == "/v1/completions":
+            # a wedged upstream: headers, `hang_after` chunks, then silence
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            for text in script["chunks"][:script.get("hang_after", 0)]:
+                data = b"data: " + json.dumps({"choices": [{"index": 0, "text": text, "finish_reason": None}]}).encode() + b"\n\n"
+                self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n"); self.wfile.flush()
+            time.sleep(script["hang"])
+            return
         if script.get("vllm_usage") and body.get("stream", True):
             # vLLM shape: no timings, usage.prompt_tokens_details.cached_tokens
             self.send_response(200)
@@ -3218,6 +3229,16 @@ class ProxyImagesTest(unittest.TestCase):
         self.assertEqual(chat[2], {"role": "tool", "tool_call_id": "x", "content": "r"})
         self.assertEqual(chat[3]["role"], "user")
         self.assertEqual(chat[3]["content"][1]["image_url"]["url"], PNG_URI)
+        # the dashboard's prepended prompt + the client's system/developer
+        # messages reach the upstream template as one leading system message
+        stacked = [{"role": "system", "content": "dashboard"},
+                   {"role": "developer", "content": [{"type": "text", "text": "client"}]},
+                   {"role": "user", "content": [{"type": "image_url", "image_url": {"url": PNG_URI}}]}]
+        chat = proxy_chat_messages(stacked, 4)
+        self.assertEqual([m["role"] for m in chat], ["system", "user"])
+        self.assertEqual(chat[0]["content"], "dashboard\nclient")
+        self.assertEqual(proxy_chat_messages([{"role": "developer", "content": "d"}, stacked[2]], 4)[0],
+                         {"role": "system", "content": "d"})
 
     def test_native_tool_call_round_trips_through_the_parser(self):
         from openai_server import parse_qwen38_tool_calls
@@ -3329,6 +3350,46 @@ class ProxyEngineTest(unittest.TestCase):
             engine = ProxyEngine("llamacpp", "test-model", env=self.env, kv_slots=kv_slots, spawn=False)
         engine.process = FakeProcess(lambda *_: None)
         return engine
+
+    def test_stalled_upstream_is_aborted_and_restarted(self):
+        for hang_after, expected in ((0, "no first token"), (1, "no output")):
+            _UpstreamHandler.script = {"status": 200, "chunks": ("Hé", "llo"), "prompt_tokens": 7,
+                                       "hang": 1.5, "hang_after": hang_after}
+            engine = self.engine()
+            engine.stall_base, engine.stall_idle, engine.stall_rate = 0.3, 0.3, 1e9
+            out = []
+            with patch.object(engine, "restart_upstream") as restart:
+                started = time.monotonic()
+                with self.assertRaises(APIError) as caught:
+                    engine.generate("Hi", 8, 0.0, 0.9, out.append)
+            self.assertLess(time.monotonic() - started, 1.4)          # aborted, not waited out
+            self.assertEqual((caught.exception.status, caught.exception.code), (503, "backend_stalled"))
+            self.assertIn(expected, caught.exception.message)
+            restart.assert_called_once()
+            self.assertEqual(engine.stalls, 1)
+            self.assertEqual(out, list(_UpstreamHandler.script["chunks"][:hang_after]))
+            engine.close()
+        # the deadline before the first token grows with the prompt
+        engine = self.engine()
+        self.assertEqual(engine.stall_deadline(0), 180.0)
+        self.assertEqual(engine.stall_deadline(100_000), 180.0 + 100_000 / 100)
+        engine.close()
+
+    def test_restart_gates_requests_until_the_upstream_is_back(self):
+        engine = self.engine()
+        steps = []
+        with patch.object(engine, "_stop_process", side_effect=lambda: steps.append("stop")), \
+             patch.object(engine, "_start_process", side_effect=lambda: (time.sleep(0.3), steps.append("start"))):
+            self.assertTrue(engine.restart_upstream("test"))
+            self.assertFalse(engine.restart_upstream("again"))       # one restart at a time
+            self.assertTrue(engine.is_alive())                       # /health stays up meanwhile
+            self.assertTrue(engine.backend.get("restarting"))
+            out = []
+            engine.generate("Hi", 8, 0.0, 0.9, out.append)           # waits for the restart
+            self.assertEqual(steps, ["stop", "start"])
+        self.assertEqual("".join(out), "Héllo")
+        self.assertNotIn("restarting", engine.backend)
+        engine.close()
 
     def test_streams_completion_and_reports_backend(self):
         engine = self.engine()
