@@ -1,4 +1,4 @@
-# AI-DER 1.3.1
+# AI-DER 1.3.2
 
 **Artificial Intelligence Distributed Engram Runner** is a local inference runner
 for Qwen3.8-Flash-Next quantized mixture-of-experts models. It combines SSD-backed
@@ -36,7 +36,7 @@ sudo apt-get update
 sudo apt-get install -y git
 git clone https://github.com/tbro0815/ai-der.git
 cd ai-der
-git checkout v1.3.1
+git checkout v1.3.2
 ./install.sh --check
 ./install.sh
 ```
@@ -122,7 +122,7 @@ Qwen repository and `engine/c/convert_mtp.py` writes `<container>/mtp`.
 Python package metadata and `ai-der --version` (`coli` remains an alias).
 Use semantic versioning: MAJOR for incompatible changes, MINOR for compatible
 features, PATCH for fixes. Releases are tagged `vMAJOR.MINOR.PATCH`; this release
-is **v1.3.1**. Internal upstream component metadata is independent.
+is **v1.3.2**. Internal upstream component metadata is independent.
 
 ```bash
 .venv/bin/ai-der --version

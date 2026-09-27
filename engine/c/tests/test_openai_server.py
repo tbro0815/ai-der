@@ -1505,6 +1505,46 @@ class HTTPTest(unittest.TestCase):
                 self.addCleanup(caught.exception.close)
                 self.assertIn("maximum context length", json.load(caught.exception)["error"]["message"])
 
+    def test_anthropic_stop_sequences_and_system_messages_in_the_conversation(self):
+        # the shape of Claude Code's auto-mode permission classifier
+        body = {"model": "test-model", "max_tokens": 64, "thinking": {"type": "disabled"},
+                "stop_sequences": ["ll"],
+                "messages": [{"role": "user", "content": "Classify this action."}]}
+        with self.request("/v1/messages", body) as response:
+            reply = json.load(response)
+        self.assertEqual((reply["stop_reason"], reply["stop_sequence"]), ("stop_sequence", "ll"))
+        self.assertEqual(reply["content"], [{"type": "text", "text": "Hé"}])
+        with self.request("/v1/messages", dict(body, stream=True)) as response:
+            events = [json.loads(line[5:]) for line in response.read().decode().splitlines()
+                      if line.startswith("data:")]
+        delta = [e for e in events if e["type"] == "message_delta"][0]["delta"]
+        self.assertEqual(delta, {"stop_reason": "stop_sequence", "stop_sequence": "ll"})
+        self.assertEqual("".join(e["delta"].get("text", "") for e in events
+                                 if e["type"] == "content_block_delta"), "Hé")
+        with self.request("/v1/messages", dict(body, stop_sequences=["zz"])) as response:
+            reply = json.load(response)
+        self.assertEqual((reply["stop_reason"], reply["stop_sequence"]), ("end_turn", None))
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/v1/messages", dict(body, stop_sequences="ll"))
+        self.addCleanup(caught.exception.close)
+        self.assertEqual(caught.exception.code, 400)
+        # system messages inside `messages`: leading ones join the system prompt,
+        # later ones become user turns (the template takes system only at the start)
+        from openai_server import anthropic_to_openai
+        converted = anthropic_to_openai({"system": "S", "messages": [
+            {"role": "system", "content": "<system-reminder>env</system-reminder>"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "system", "content": [{"type": "text", "text": "later note"}]},
+            {"role": "user", "content": "go"}]})
+        self.assertEqual(converted, [
+            {"role": "system", "content": "S\n\n<system-reminder>env</system-reminder>"},
+            {"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "later note"}, {"role": "user", "content": "go"}])
+        with self.request("/v1/messages", dict(body, stop_sequences=None, messages=[
+                {"role": "system", "content": "env"}, {"role": "user", "content": "hi"}])) as response:
+            self.assertEqual(response.status, 200)
+
     def test_models_list_advertises_claude_aliases_in_both_shapes(self):
         with patch.dict("os.environ", {"COLI_ADVERTISED_MODELS": "claude-opus-5-5, claude-sonnet-5"}):
             with self.request("/v1/models?limit=1000") as response:

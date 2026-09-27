@@ -2473,9 +2473,27 @@ def anthropic_to_openai(body):
         if not isinstance(message, dict):
             raise APIError(400, "Each message must be an object.", f"messages.{index}")
         role = message.get("role")
+        if role == "system":
+            # Claude Code sends some context (its environment <system-reminder>)
+            # as a system message inside `messages`.  Before the first turn it
+            # joins the system prompt; later it becomes a user turn, since the
+            # chat template takes a system message only at the start.
+            content = message.get("content")
+            text = content if isinstance(content, str) else _anthropic_block_text(
+                content if isinstance(content, list) else [], f"messages.{index}.content")
+            if not text:
+                continue
+            if all(m["role"] == "system" for m in messages):
+                if messages:
+                    messages[0]["content"] += "\n\n" + text
+                else:
+                    messages.append({"role": "system", "content": text})
+            else:
+                messages.append({"role": "user", "content": text})
+            continue
         if role not in ("user", "assistant"):
             raise APIError(400, f"Input message role {role!r} is not supported. Anthropic messages are "
-                           "`user` or `assistant`; a system prompt goes in the top-level `system`.",
+                           "`user`, `assistant` or `system`.",
                            f"messages.{index}.role", "unsupported_role")
         content = message.get("content")
         if isinstance(content, str):
@@ -6656,11 +6674,17 @@ class APIHandler(BaseHTTPRequestHandler):
                        {"Cache-Control": "no-store", "X-Token-Count": "exact" if exact else "estimate"})
 
     def anthropic_messages(self, body, request_id):
-        for unsupported, why in (("stop_sequences", "custom stop sequences"),
-                                 ("top_k", "top-k sampling")):
-            if body.get(unsupported) not in (None, [], ""):
-                raise APIError(400, f"Colibri does not support `{unsupported}` ({why}) yet.",
-                               unsupported, "unsupported_value")
+        if body.get("top_k") not in (None, [], ""):
+            raise APIError(400, "Colibri does not support `top_k` (top-k sampling) yet.",
+                           "top_k", "unsupported_value")
+        stop_sequences = body.get("stop_sequences")
+        if stop_sequences in ([], ""):
+            stop_sequences = None
+        if stop_sequences is not None and (
+                not isinstance(stop_sequences, list) or len(stop_sequences) > 4 or
+                not all(isinstance(q, str) and q for q in stop_sequences)):
+            raise APIError(400, "`stop_sequences` must be an array of 1 to 4 non-empty strings.",
+                           "stop_sequences", "invalid_value")
         messages = anthropic_to_openai(body)
         tools, tool_choice = anthropic_tools(body)
         thinking = body.get("thinking")
@@ -6679,6 +6703,10 @@ class APIHandler(BaseHTTPRequestHandler):
         translated = {"messages": messages, "max_tokens": body.get("max_tokens"),
                       "temperature": body.get("temperature"), "top_p": body.get("top_p"),
                       "stream": body.get("stream", False), "cache_slot": body.get("cache_slot")}
+        if stop_sequences:
+            # the permission classifier of Claude Code's auto mode ends its
+            # verdict with a stop sequence ("</severity>")
+            translated["stop"] = stop_sequences
         if tools:
             translated["tools"] = tools
         if tool_choice is not None:
@@ -6738,8 +6766,7 @@ class APIHandler(BaseHTTPRequestHandler):
         if budget and budget > maximum:
             budget = maximum
         # Same policy as /v1/chat/completions: `body` is the translated OpenAI-shaped
-        # request, and anthropic_messages() has already refused a client `stop_sequences`,
-        # so this resolves to the implicit GLM role boundaries.
+        # request, whose `stop` carries the client's `stop_sequences`.
         stop_sequences, ignore_leading_stop = stop_policy(body, True)
         cache_slot = body.get("cache_slot")
         if (cache_slot is not None and
@@ -6808,10 +6835,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 sideband.finish()
                 content, stop_reason = blocks_and_stop("".join(output), stats,
                                                        sideband.reply())
+                matched = stop_filter.matched if stop_reason == "end_turn" else None
+                if matched:
+                    stop_reason = "stop_sequence"
                 self.send_json(200, {
                     "id": message_id, "type": "message", "role": "assistant",
                     "model": self.server.model_id, "content": content,
-                    "stop_reason": stop_reason, "stop_sequence": None,
+                    "stop_reason": stop_reason, "stop_sequence": matched,
                     "usage": usage(stats)},
                     request_id, queue_headers)
                 return
@@ -6970,6 +7000,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
             content, stop_reason = blocks_and_stop("".join(raw), stats,
                                                    sideband.reply())
+            matched = stop_filter.matched if stop_reason == "end_turn" else None
+            if matched:
+                stop_reason = "stop_sequence"
             index = text_index + 1 if stream_state["text_started"] else 1
             for block in content:
                 if block["type"] != "tool_use":
@@ -6983,7 +7016,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 send_event("content_block_stop", {"type": "content_block_stop", "index": index})
                 index += 1
             send_event("message_delta", {"type": "message_delta",
-                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "delta": {"stop_reason": stop_reason, "stop_sequence": matched},
                 # input_tokens here too (the API sends cumulative usage in
                 # message_delta): message_start goes out before the prompt is
                 # counted, and Claude Code tracks its context from this value
