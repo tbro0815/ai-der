@@ -1461,6 +1461,50 @@ class HTTPTest(unittest.TestCase):
             self.addCleanup(caught.exception.close)
             self.assertEqual(caught.exception.code, 404)
 
+    def test_alias_requests_scale_usage_to_the_client_assumed_window(self):
+        body = {"model": "claude-opus-5-5", "max_tokens": 8,
+                "messages": [{"role": "user", "content": "Hello there"}]}
+        env = {"COLI_MODEL_ALIASES": "claude-*", "COLI_CLIENT_ASSUMED_WINDOW": "200"}
+        with patch.dict("os.environ", env), patch.object(self.server, "context_window", 100):
+            with self.request("/v1/messages", body) as response:
+                usage = json.load(response)["usage"]
+            self.assertEqual(usage, {"input_tokens": 14, "output_tokens": 4})     # FakeEngine 7/2, x2
+            with self.request("/v1/messages", dict(body, stream=True)) as response:
+                events = [json.loads(line[5:]) for line in response.read().decode().splitlines()
+                          if line.startswith("data:")]
+            delta = [e for e in events if e["type"] == "message_delta"][0]
+            self.assertEqual(delta["usage"], {"input_tokens": 14, "output_tokens": 4})
+            with self.request("/v1/messages", dict(body, model="test-model")) as response:
+                self.assertEqual(json.load(response)["usage"], {"input_tokens": 7, "output_tokens": 2})
+            with patch.dict("os.environ", {"COLI_CLIENT_ASSUMED_WINDOW": ""}):
+                with self.request("/v1/messages/count_tokens", body) as response:
+                    plain = json.load(response)["input_tokens"]
+            with self.request("/v1/messages/count_tokens", body) as response:
+                self.assertEqual(json.load(response)["input_tokens"], round(plain * 2))
+            # overflow in Anthropic's wording, numbers on the client's scale
+            overflow = APIError(400, "This model's maximum context length is 100 tokens, however your "
+                                     "messages resulted in at least 120 tokens.",
+                                "messages", "context_length_exceeded")
+            with patch.object(self.engine, "generate", side_effect=overflow):
+                with self.assertRaises(HTTPError) as caught:
+                    self.request("/v1/messages", body)
+                self.addCleanup(caught.exception.close)
+                self.assertEqual(caught.exception.code, 400)
+                error = json.load(caught.exception)
+                self.assertEqual(error["type"], "error")
+                self.assertEqual(error["error"]["message"], "prompt is too long: 240 tokens > 200 maximum")
+                # mid-stream (native engine: the 200 is already sent): an `error` event
+                with self.request("/v1/messages", dict(body, stream=True)) as response:
+                    events = [json.loads(line[5:]) for line in response.read().decode().splitlines()
+                              if line.startswith("data:")]
+                self.assertEqual(events[-1], {"type": "error", "error": {
+                    "type": "invalid_request_error", "message": "prompt is too long: 240 tokens > 200 maximum"}})
+                # the OpenAI path keeps its own wording
+                with self.assertRaises(HTTPError) as caught:
+                    self.request("/v1/chat/completions", dict(body, model="test-model"))
+                self.addCleanup(caught.exception.close)
+                self.assertIn("maximum context length", json.load(caught.exception)["error"]["message"])
+
     def test_models_list_advertises_claude_aliases_in_both_shapes(self):
         with patch.dict("os.environ", {"COLI_ADVERTISED_MODELS": "claude-opus-5-5, claude-sonnet-5"}):
             with self.request("/v1/models?limit=1000") as response:

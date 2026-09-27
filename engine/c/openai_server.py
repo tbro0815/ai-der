@@ -4560,7 +4560,18 @@ class ProxyEngine(Engine):
 
     def _count_tokens(self, text):
         """Token count of `text` from the upstream's /tokenize (llama-server and
-        vLLM both serve it; no GPU work).  None when unavailable."""
+        vLLM both serve it; no GPU work).  None when unavailable.  The last
+        count is memoized: the Anthropic preflight and generate() ask twice."""
+        key = hashlib.sha256(text.encode("utf-8", "surrogatepass")).digest()
+        memo = getattr(self, "_count_memo", None)
+        if memo is not None and memo[0] == key:
+            return memo[1]
+        count = self._count_tokens_upstream(text)
+        if count is not None:
+            self._count_memo = (key, count)
+        return count
+
+    def _count_tokens_upstream(self, text):
         body = ({"content": text} if self.backend_id == "llamacpp"
                 else {"model": self.upstream_model, "prompt": text})
         try:
@@ -5906,7 +5917,10 @@ class APIHandler(BaseHTTPRequestHandler):
             elif path == "/v1/completions":
                 self.completion(body, request_id)
             elif path == "/v1/messages":
-                self.anthropic_messages(body, request_id)
+                try:
+                    self.anthropic_messages(body, request_id)
+                except APIError as error:
+                    raise self.anthropic_overflow(error, self.client_token_scale(body)) from None
             elif path == "/v1/messages/count_tokens":
                 self.anthropic_count_tokens(body, request_id)
             elif path == "/v1/responses":
@@ -6437,6 +6451,37 @@ class APIHandler(BaseHTTPRequestHandler):
     # Images count COUNT_TOKENS_PER_IMAGE each.
     COUNT_TOKENS_PER_IMAGE = 1024
 
+    def client_token_scale(self, body):
+        """COLI_CLIENT_ASSUMED_WINDOW: the window a client assumes for the model
+        ids it sends (Claude Code: 200K for every model, non-Anthropic ones
+        included).  Requests under an alias id (COLI_MODEL_ALIASES) get their
+        reported token counts scaled by assumed / served window, so the client's
+        own fill level, and with it its auto-compaction, tracks the real window
+        of the active context profile.  1.0 for the served id or when unset."""
+        assumed = _positive_env("COLI_CLIENT_ASSUMED_WINDOW", 0)
+        window = self.server.context_window
+        if not assumed or not window or body.get("model") == self.server.model_id:
+            return 1.0
+        return assumed / window
+
+    # Anthropic's own overflow wording: Claude Code recognizes "prompt is too
+    # long" (and reads the two numbers) where the OpenAI-style message is an
+    # unknown 400.
+    CONTEXT_NUMBERS = re.compile(r"maximum context length is (\d+) tokens.*?(\d+) (?:input )?tokens", re.S)
+
+    def anthropic_overflow(self, error, scale=1.0):
+        if getattr(error, "code", None) != "context_length_exceeded" or \
+                error.message.startswith("prompt is too long"):
+            return error
+        match = self.CONTEXT_NUMBERS.search(error.message)
+        if match:
+            limit, used = int(match.group(1)), int(match.group(2))
+            message = (f"prompt is too long: {round(used * scale)} tokens > "
+                       f"{round(limit * scale)} maximum")
+        else:
+            message = f"prompt is too long: {error.message}"
+        return APIError(error.status, message, error.param, error.code, error.error_type, error.headers)
+
     def anthropic_count_tokens(self, body, request_id):
         messages = anthropic_to_openai(body)
         tools, tool_choice = anthropic_tools(body)
@@ -6464,6 +6509,7 @@ class APIHandler(BaseHTTPRequestHandler):
         if count is None:
             count = math.ceil(len(prompt) / 3.5)
         count += images * self.COUNT_TOKENS_PER_IMAGE
+        count = round(count * self.client_token_scale(body))
         self.send_json(200, {"input_tokens": count}, request_id,
                        {"Cache-Control": "no-store", "X-Token-Count": "exact" if exact else "estimate"})
 
@@ -6522,12 +6568,27 @@ class APIHandler(BaseHTTPRequestHandler):
         prompt = render_chat_for_arch(messages, enable_thinking, effort, tools, tool_choice,
                                       preserve_thinking=defaults.get("preserve_thinking", False))
         self.anthropic_generation(translated, prompt, request_id, tools, enable_thinking,
-                                  image=image)
+                                  image=image, token_scale=self.client_token_scale(body))
 
-    def anthropic_generation(self, body, prompt, request_id, tools, enable_thinking, image=None):
+    def anthropic_generation(self, body, prompt, request_id, tools, enable_thinking, image=None,
+                             token_scale=1.0):
         maximum, temperature, top_p, grammar, _stop_sequences = generation_options(
             body, self.server.max_tokens, thinking=enable_thinking,
             api_defaults=self.server.api_defaults)
+        engine = self.server.engine
+        if isinstance(engine, ProxyEngine) and image is None and body.get("stream"):
+            # an overflow must be a 400 before the stream commits a 200, or the
+            # client sees a dropped stream instead of "prompt is too long"
+            counted = engine._count_tokens(prompt)
+            if counted is not None and engine.context_window - counted - 16 < 1:
+                raise APIError(400, f"This model's maximum context length is {engine.context_window} "
+                                    f"tokens, however your messages resulted in {counted} tokens.",
+                               "messages", "context_length_exceeded")
+
+        def usage(stats):
+            # token_scale: see client_token_scale
+            return {"input_tokens": round(int(stats.get("prompt_tokens") or 0) * token_scale),
+                    "output_tokens": round(int(stats.get("completion_tokens") or 0) * token_scale)}
         # thinking budget (Anthropic `thinking.budget_tokens` or the dashboard default)
         budget = body.get("thinking_budget") if enable_thinking else None
         if budget is not None and (isinstance(budget, bool) or not isinstance(budget, int) or budget < 0):
@@ -6609,8 +6670,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     "id": message_id, "type": "message", "role": "assistant",
                     "model": self.server.model_id, "content": content,
                     "stop_reason": stop_reason, "stop_sequence": None,
-                    "usage": {"input_tokens": stats["prompt_tokens"],
-                              "output_tokens": stats["completion_tokens"]}},
+                    "usage": usage(stats)},
                     request_id, queue_headers)
                 return
 
@@ -6738,12 +6798,21 @@ class APIHandler(BaseHTTPRequestHandler):
             def generation_stopped():
                 return stop_filter.stopped() or sideband.stopped()
 
-            stats = self.server.engine.generate(
-                prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                lambda: not connected[0], grammar=grammar, stopped=generation_stopped,
-                **({"on_tool": sideband.feed} if sideband.enabled else {}),
-                **({"image": image} if image is not None else {}),
-                **({"reasoning_budget": budget} if budget else {}))
+            try:
+                stats = self.server.engine.generate(
+                    prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
+                    lambda: not connected[0], grammar=grammar, stopped=generation_stopped,
+                    **({"on_tool": sideband.feed} if sideband.enabled else {}),
+                    **({"image": image} if image is not None else {}),
+                    **({"reasoning_budget": budget} if budget else {}))
+            except APIError as error:
+                # the 200 is on the wire: report it the way the Anthropic API
+                # does mid-stream, with an `error` event
+                ka_stop.set()
+                error = self.anthropic_overflow(error, token_scale)
+                send_event("error", {"type": "error", "error": {"type": error.error_type,
+                                                                "message": error.message}})
+                return
             stop_filter.finish()
             sideband.finish()
             if split:
@@ -6776,8 +6845,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 # input_tokens here too (the API sends cumulative usage in
                 # message_delta): message_start goes out before the prompt is
                 # counted, and Claude Code tracks its context from this value
-                "usage": {"input_tokens": int(stats.get("prompt_tokens") or 0),
-                          "output_tokens": stats["completion_tokens"]}})
+                "usage": usage(stats)})
             send_event("message_stop", {"type": "message_stop"})
             # close_connection was already set when the 200 was committed (#597 item 3).
 
