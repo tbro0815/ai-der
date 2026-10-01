@@ -2289,19 +2289,25 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
 
 def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                          tool_choice=None, audio_out=None, preserve_thinking=True, spans=None):
-    """Render a chat request with the active engine's native prompt contract."""
+    """Render a chat request with the active engine's native prompt contract.
+
+    NUL characters become U+FFFD: a harness tool result that prints raw binary
+    would otherwise 400 every later turn of that conversation, since the result
+    is resent each time. One character for one keeps the renderer's spans valid."""
     if ARCH == "inkling":
-        return render_chat_inkling(messages, enable_thinking, reasoning_effort, tools,
-                                    tool_choice, audio_out=audio_out)
-    if ARCH == "qwen38":
-        return render_chat_qwen38(messages, enable_thinking, reasoning_effort, tools,
-                                  tool_choice, preserve_thinking=preserve_thinking, spans=spans)
-    renderer = (render_chat_glm53 if ARCH == "glm53" else
-                render_chat_kimi if ARCH == "kimi" else
-                render_chat_qwen if ARCH == "qwen36" else
-                render_chat_v4 if ARCH == "deepseek_v4" else
-                render_chat_olmoe if ARCH == "olmoe" else render_chat)
-    return renderer(messages, enable_thinking, reasoning_effort, tools, tool_choice)
+        prompt = render_chat_inkling(messages, enable_thinking, reasoning_effort, tools,
+                                     tool_choice, audio_out=audio_out)
+    elif ARCH == "qwen38":
+        prompt = render_chat_qwen38(messages, enable_thinking, reasoning_effort, tools,
+                                    tool_choice, preserve_thinking=preserve_thinking, spans=spans)
+    else:
+        renderer = (render_chat_glm53 if ARCH == "glm53" else
+                    render_chat_kimi if ARCH == "kimi" else
+                    render_chat_qwen if ARCH == "qwen36" else
+                    render_chat_v4 if ARCH == "deepseek_v4" else
+                    render_chat_olmoe if ARCH == "olmoe" else render_chat)
+        prompt = renderer(messages, enable_thinking, reasoning_effort, tools, tool_choice)
+    return prompt.replace("\0", "\ufffd")
 
 
 # ---- Anthropic Messages API (#343) --------------------------------------------------------
@@ -6766,8 +6772,10 @@ class APIHandler(BaseHTTPRequestHandler):
         if budget and budget > maximum:
             budget = maximum
         # Same policy as /v1/chat/completions: `body` is the translated OpenAI-shaped
-        # request, whose `stop` carries the client's `stop_sequences`.
+        # request, whose `stop` carries the client's `stop_sequences`. Only those are
+        # reported as `stop_sequence`; an implicit GLM role boundary is an end_turn.
         stop_sequences, ignore_leading_stop = stop_policy(body, True)
+        client_stops = bool(body.get("stop"))
         cache_slot = body.get("cache_slot")
         if (cache_slot is not None and
                 (isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or
@@ -6835,7 +6843,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 sideband.finish()
                 content, stop_reason = blocks_and_stop("".join(output), stats,
                                                        sideband.reply())
-                matched = stop_filter.matched if stop_reason == "end_turn" else None
+                matched = stop_filter.matched if client_stops and stop_reason == "end_turn" else None
                 if matched:
                     stop_reason = "stop_sequence"
                 self.send_json(200, {
@@ -7000,7 +7008,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
             content, stop_reason = blocks_and_stop("".join(raw), stats,
                                                    sideband.reply())
-            matched = stop_filter.matched if stop_reason == "end_turn" else None
+            matched = stop_filter.matched if client_stops and stop_reason == "end_turn" else None
             if matched:
                 stop_reason = "stop_sequence"
             index = text_index + 1 if stream_state["text_started"] else 1

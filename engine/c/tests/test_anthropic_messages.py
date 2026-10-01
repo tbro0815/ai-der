@@ -106,15 +106,15 @@ class TranslationTest(unittest.TestCase):
         self.assertEqual(anthropic_tools({"tool_choice": {"type": "any"}})[1], "required")
         self.assertEqual(anthropic_tools({"tool_choice": {"type": "auto"}})[1], "auto")
 
-    def test_system_role_rejection_triggers_claude_code_fallback(self):
+    def test_unknown_role_is_refused(self):
+        # system messages inside `messages` are accepted since 1.3.2
+        # (test_openai_server covers their placement); other roles still refuse
         with self.assertRaises(APIError) as caught:
-            anthropic_to_openai({"messages": [{"role": "system", "content": "no"}]})
+            anthropic_to_openai({"messages": [{"role": "tool", "content": "no"}]})
         error = caught.exception
         self.assertEqual(error.status, 400)
-        # Claude Code 2.1.212 retries without its model-gated mid-conversation
-        # system turn only when the upstream rejection matches this contract.
         self.assertIn("not supported", error.message)
-        self.assertRegex(error.message, re.compile(r"role .{0,2}system", re.IGNORECASE))
+        self.assertRegex(error.message, re.compile(r"role .{0,2}tool", re.IGNORECASE))
 
 
 class MessagesHTTPTest(unittest.TestCase):
@@ -433,7 +433,7 @@ class MessagesHTTPTest(unittest.TestCase):
         self.assertEqual(payloads[-2]["delta"]["stop_reason"], "tool_use")
 
     def test_unsupported_fields_refuse_loudly(self):
-        for field, value in (("stop_sequences", ["STOP"]), ("top_k", 40)):
+        for field, value in (("top_k", 40),):
             with self.assertRaises(HTTPError) as caught:
                 self.post(self.base_body(**{field: value}))
             self.addCleanup(caught.exception.close)

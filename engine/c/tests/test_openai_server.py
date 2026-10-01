@@ -108,6 +108,21 @@ class TemplateTest(unittest.TestCase):
         self.assertNotIn("private work", without)
         self.assertIn("<|im_start|>assistant\nAnswer<|im_end|>", without)
 
+    def test_nul_in_tool_result_is_replaced_not_rejected(self):
+        messages = [
+            {"role": "user", "content": "Read it"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {
+                    "name": "python", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "a\0b\0"},
+        ]
+        for arch in ("qwen38", "glm53"):
+            with self.subTest(arch=arch), patch("openai_server.ARCH", arch):
+                spans = []
+                prompt = openai_server.render_chat_for_arch(messages, spans=spans)
+                self.assertNotIn("\0", prompt)
+                self.assertIn("a\ufffdb\ufffd", prompt)
+
     def test_qwen38_tool_round_trip(self):
         tools = [{"type": "function", "function": {
             "name": "get_weather", "description": "Get weather",
