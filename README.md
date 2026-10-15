@@ -8,6 +8,8 @@ an OpenAI-compatible API and a browser dashboard with chat.
 AI-DER is based on [colibrì](https://github.com/JustVugg/colibri), with a custom
 Qwen3.8 engine, container converter, GPU routing and inference kernels.
 
+![The AI-DER dashboard: runtime and inference settings, live engine log](engine/web/screenshots/dashboard.webp)
+
 ## System requirements
 
 - PC running **Ubuntu 24.04 or 26.04 LTS, x86_64**, with a CUDA-compatible NVIDIA driver.
