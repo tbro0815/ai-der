@@ -1,4 +1,4 @@
-# AI-DER 1.3.3
+# AI-DER 1.3.4
 
 **Artificial Intelligence Distributed Engram Runner** is a local inference runner
 for Qwen3.8-Flash-Next quantized mixture-of-experts models. It combines SSD-backed
@@ -36,7 +36,7 @@ sudo apt-get update
 sudo apt-get install -y git
 git clone https://github.com/tbro0815/ai-der.git
 cd ai-der
-git checkout v1.3.3
+git checkout v1.3.4
 ./install.sh --check
 ./install.sh
 ```
@@ -55,8 +55,8 @@ Run the installer as your normal user. The default installation does everything:
    minutes after the download; every step resumes on rerun.
 3. **llama.cpp backend** (`engine/c/install_llamacpp.sh`): `llama-server` built with
    CUDA at a pinned revision.
-4. **vLLM backend** (`engine/c/install_vllm.sh`): the syv-ai Qwen3.8-27B stack at a
-   pinned revision in its own Python 3.12 venv, the published W4A16 weights, the
+4. **vLLM backend** (`engine/c/install_vllm.sh`): the syv-ai HyperQwen stack (Qwen3.8-27B
+   on vLLM 0.31.0) at a pinned revision in its own Python 3.12 venv, the published W4A16 weights, the
    one-time CPU preparation (int8 heads, int8 MTP draft, draft vocabulary, fast
    variant) and the stack's vLLM patches.
 5. **`ai-der.env`** in the checkout: the serving environment for all installed
@@ -122,7 +122,7 @@ Qwen repository and `engine/c/convert_mtp.py` writes `<container>/mtp`.
 Python package metadata and `ai-der --version` (`coli` remains an alias).
 Use semantic versioning: MAJOR for incompatible changes, MINOR for compatible
 features, PATCH for fixes. Releases are tagged `vMAJOR.MINOR.PATCH`; this release
-is **v1.3.3**. Internal upstream component metadata is independent.
+is **v1.3.4**. Internal upstream component metadata is independent.
 
 ```bash
 .venv/bin/ai-der --version

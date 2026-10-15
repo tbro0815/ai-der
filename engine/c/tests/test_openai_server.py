@@ -3180,6 +3180,20 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
             self.send_response(200); self.send_header("Content-Length", str(len(payload))); self.end_headers()
             self.wfile.write(payload)
             return
+        if script.get("error_event") and self.path == "/v1/completions":
+            # vLLM after an engine death: a 200 stream that ends with an error event
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            for event in [{"choices": [{"index": 0, "text": t, "finish_reason": None}]}
+                          for t in script["chunks"]] + [{"error": {"message": script["error_event"],
+                                                                     "type": "InternalServerError", "code": 500}}]:
+                data = b"data: " + json.dumps(event).encode() + b"\n\n"
+                self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n"); self.wfile.flush()
+            data = b"data: [DONE]\n\n"
+            self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n0\r\n\r\n"); self.wfile.flush()
+            return
         if script.get("hang") is not None and self.path == "/v1/completions":
             # a wedged upstream: headers, `hang_after` chunks, then silence
             self.send_response(200)
@@ -3213,6 +3227,8 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
         if script["status"] != 200:
+            if script.get("die"):
+                script["die"]()                                  # the upstream exits after answering
             payload = json.dumps({"error": {"message": script["message"]}}).encode()
             self.send_response(script["status"]); self.send_header("Content-Length", str(len(payload)))
             self.end_headers(); self.wfile.write(payload)
@@ -3428,6 +3444,85 @@ class ProxyEngineTest(unittest.TestCase):
         engine = self.engine()
         self.assertEqual(engine.stall_deadline(0), 180.0)
         self.assertEqual(engine.stall_deadline(100_000), 180.0 + 100_000 / 100)
+        engine.close()
+
+    def test_error_event_in_the_stream_fails_the_request(self):
+        # 2026-10-15: vLLM's engine core died (CUDA illegal memory access); the
+        # in-flight stream ended with an error event and reached the client as
+        # an empty reply with a normal stop
+        _UpstreamHandler.script = {"status": 200, "chunks": ("Hé",), "prompt_tokens": 7,
+                                   "error_event": "EngineCore encountered an issue."}
+        engine = self.engine()
+        with self.assertRaises(RuntimeError) as caught:
+            engine.generate("Hi", 8, 0.0, 0.9, [].append)
+        self.assertIn("EngineCore encountered an issue.", str(caught.exception))
+        engine.close()
+
+    def test_refused_upstream_connection_is_a_backend_error(self):
+        # a ConnectionError reads as the client hanging up in the handler, which
+        # then sent no response at all
+        engine = self.engine()
+        engine.DEATH_GRACE = 0.2                                     # alive: no retry after the grace
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        engine.port = probe.getsockname()[1]
+        probe.close()
+        for call in (lambda: engine.generate("Hi", 8, 0.0, 0.9, [].append),
+                     lambda: engine._post_json("/slots/0?action=save", {})):
+            with self.assertRaises(RuntimeError) as caught:
+                call()
+            self.assertNotIsInstance(caught.exception, ConnectionError)
+            self.assertIn("connection failed", str(caught.exception))
+        self.assertIsNone(engine._count_tokens("Hi"))
+        engine.close()
+
+    def test_exited_upstream_is_revived(self):
+        engine = self.engine()
+        engine.process.returncode = 0                                # vLLM exited after its engine died
+        self.assertFalse(engine.is_alive())
+        steps = []
+
+        def start():
+            time.sleep(0.3)
+            engine.process = FakeProcess(lambda *_: None)
+            steps.append("start")
+
+        with patch.object(engine, "_stop_process", side_effect=lambda: steps.append("stop")), \
+             patch.object(engine, "_start_process", side_effect=start):
+            out = []
+            engine.generate("Hi", 8, 0.0, 0.9, out.append)           # revives, waits, runs
+            self.assertEqual(steps, ["stop", "start"])
+            self.assertEqual("".join(out), "Héllo")
+            engine.process.returncode = 0
+            self.assertFalse(engine.revive_upstream())               # one attempt a minute
+            with self.assertRaises(RuntimeError):
+                engine.generate("Hi", 8, 0.0, 0.9, [].append)
+        engine.close()
+
+    def test_request_waits_out_an_upstream_that_dies_under_it(self):
+        # 2026-10-15: the retries right after the crash got vLLM's 500 (its API
+        # server answers for about a second after the engine core died) and a
+        # refused connection; a request that fails before its stream started
+        # now waits for the restart when the process exits, and runs again
+        engine = self.engine()
+        _UpstreamHandler.script = {"status": 500, "message": "EngineCore encountered an issue.",
+                                   "chunks": ("Hé", "llo"), "prompt_tokens": 7,
+                                   "die": lambda: setattr(engine.process, "returncode", 0)}
+
+        def start():
+            engine.process = FakeProcess(lambda *_: None)
+            _UpstreamHandler.script = {"status": 200, "chunks": ("Hé", "llo"), "prompt_tokens": 7}
+
+        with patch.object(engine, "_stop_process"), patch.object(engine, "_start_process", side_effect=start):
+            out = []
+            engine.generate("Hi", 8, 0.0, 0.9, out.append)
+        self.assertEqual("".join(out), "Héllo")
+        # a 500 from an upstream that stays up is passed on, not retried
+        engine.DEATH_GRACE = 0.2
+        _UpstreamHandler.script = {"status": 500, "message": "boom", "chunks": (), "prompt_tokens": 7}
+        with self.assertRaises(RuntimeError) as caught:
+            engine.generate("Hi", 8, 0.0, 0.9, [].append)
+        self.assertIn("boom", str(caught.exception))
         engine.close()
 
     def test_restart_gates_requests_until_the_upstream_is_back(self):

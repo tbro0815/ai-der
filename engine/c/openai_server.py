@@ -89,6 +89,11 @@ class UpstreamStalled(RuntimeError):
     """A proxy backend's stream made no progress within its stall deadline."""
 
 
+class UpstreamGone(RuntimeError):
+    """A proxy backend refused the connection or answered 5xx before its stream
+    started; generate() retries once when the upstream process has exited."""
+
+
 class ClientCancelled(Exception):
     pass
 
@@ -4510,9 +4515,13 @@ class ProxyEngine(Engine):
         self.ready.set()
         self.restart_lock = threading.Lock()
         self.stalls = 0
+        self.revive_after = 0.0               # earliest next restart of an exited upstream
         if spawn:
             print(f"[api] backend {backend}: {' '.join(shlex.quote(c) for c in cmd)}", file=sys.stderr)
             self._start_process()
+            threading.Thread(target=self._watch_upstream, name=f"{backend}-watch", daemon=True).start()
+
+    DEATH_GRACE = 5.0     # seconds an upstream gets to exit after failing a request
 
     # prefill-rate floors for the stall deadline (tok/s; measured cold: vLLM
     # 680 at 188K and 1,450 at 3K, llama.cpp 176 at 261K)
@@ -4530,7 +4539,7 @@ class ProxyEngine(Engine):
         if self.backend_id == "vllm":
             self.warm_prefixes()
 
-    def restart_upstream(self, reason):
+    def restart_upstream(self, reason, tag="stall"):
         """Stop and start the upstream in the background; generate() waits on
         `ready` meanwhile, so queued requests run on the fresh upstream."""
         with self.restart_lock:
@@ -4542,20 +4551,58 @@ class ProxyEngine(Engine):
         def run():
             started = time.monotonic()
             try:
-                print(f"[stall] restarting {self.backend['label']}: {reason}", file=sys.stderr)
+                print(f"[{tag}] restarting {self.backend['label']}: {reason}", file=sys.stderr)
                 self._stop_process()
                 if not self.closed:
                     self._start_process()
-                    print(f"[stall] {self.backend['label']} back after "
+                    print(f"[{tag}] {self.backend['label']} back after "
                           f"{time.monotonic() - started:.0f} s", file=sys.stderr)
             except Exception as error:
-                print(f"[stall] {self.backend['label']} restart failed: {error}", file=sys.stderr)
+                print(f"[{tag}] {self.backend['label']} restart failed: {error}", file=sys.stderr)
             finally:
                 self.backend.pop("restarting", None)
                 self.ready.set()
 
         threading.Thread(target=run, name=f"{self.backend_id}-restart", daemon=True).start()
         return True
+
+    def revive_upstream(self):
+        """Restart an upstream that exited on its own: a CUDA fault kills vLLM's
+        engine core and its API server exits after it, which left the gateway
+        answering "not running" until a manual restart.  At most one attempt a
+        minute, so an upstream that dies during startup is retried, not spun."""
+        process = self.process
+        if (self.closed or process is None or process.poll() is None
+                or time.monotonic() < self.revive_after):
+            return False
+        self.revive_after = time.monotonic() + 60.0
+        return self.restart_upstream(f"exited with code {process.returncode}", tag="revive")
+
+    def _watch_upstream(self):
+        while not self.closed:
+            time.sleep(2.0)
+            if self.ready.is_set():
+                self.revive_upstream()
+
+    def _await_ready(self, cancelled):
+        waited = time.monotonic()
+        while not self.ready.wait(1.0):
+            if cancelled and cancelled():
+                raise ClientCancelled()
+            if time.monotonic() - waited > self.start_timeout + 120:
+                raise RuntimeError(f"{self.backend['label']} did not come back from its restart")
+
+    def _died_under_request(self):
+        """After an UpstreamGone: True when the upstream process exits within a
+        few seconds (vLLM's API server answers 500 for about a second after its
+        engine core died, then exits) and its restart is under way."""
+        process = self.process
+        deadline = time.monotonic() + self.DEATH_GRACE
+        while process is not None and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if process is None or process.poll() is None:
+            return False
+        return not self.ready.is_set() or self.revive_upstream()
 
     def stall_deadline(self, prompt_tokens):
         """Seconds allowed before the first streamed token."""
@@ -4653,6 +4700,8 @@ class ProxyEngine(Engine):
             conn.request("POST", path, json.dumps(body), {"Content-Type": "application/json"})
             response = conn.getresponse()
             raw = response.read()
+        except ConnectionError as error:      # not the client hanging up (see _stream_upstream)
+            raise RuntimeError(f"{self.backend['label']} connection failed: {error}") from error
         finally:
             conn.close()
         try:
@@ -4679,7 +4728,7 @@ class ProxyEngine(Engine):
                 else {"model": self.upstream_model, "prompt": text})
         try:
             status, data, _raw = self._post_json("/tokenize", body, timeout=30.0)
-        except (OSError, http.client.HTTPException):
+        except (OSError, http.client.HTTPException, RuntimeError):
             return None
         if status != 200 or not isinstance(data, dict):
             return None
@@ -4808,13 +4857,10 @@ class ProxyEngine(Engine):
         payload = prompt.encode("utf-8")
         if b"\0" in payload:
             raise APIError(400, "NUL bytes are not supported in prompts.", "messages")
-        # a stall restart in progress: wait for the fresh upstream
-        waited = time.monotonic()
-        while not self.ready.wait(1.0):
-            if cancelled and cancelled():
-                raise ClientCancelled()
-            if time.monotonic() - waited > self.start_timeout + 120:
-                raise RuntimeError(f"{self.backend['label']} did not come back from its restart")
+        # an exited upstream is restarted here too (the watchdog polls every 2 s);
+        # a restart in progress: wait for the fresh upstream
+        self.revive_upstream()
+        self._await_ready(cancelled)
         counted = None
         # Clamp the output to the window like the native engine does: clients
         # such as Claude Code ask for a fixed 32K max_tokens, which together
@@ -4890,16 +4936,26 @@ class ProxyEngine(Engine):
                                  f"({error}) and is being restarted; retry the request in a "
                                  "minute or two.", None, "backend_stalled", "server_error")
 
-        try:
-            if chat is not None:
-                first = self._chat_once(chat, max_tokens, temperature, top_p, on_text, cancelled,
-                                        budget_stop, on_accept, prompt_tokens=estimate)
-            else:
-                first = self._stream_once(prompt, max_tokens, temperature, top_p, cache_slot, grammar,
-                                          on_text_counted if think_open else on_text, cancelled,
-                                          budget_stop, on_accept, media=media, prompt_tokens=estimate)
-        except UpstreamStalled as error:
-            raise stalled(error) from None
+        for retry in (False, True):
+            try:
+                if chat is not None:
+                    first = self._chat_once(chat, max_tokens, temperature, top_p, on_text, cancelled,
+                                            budget_stop, on_accept, prompt_tokens=estimate)
+                else:
+                    first = self._stream_once(prompt, max_tokens, temperature, top_p, cache_slot, grammar,
+                                              on_text_counted if think_open else on_text, cancelled,
+                                              budget_stop, on_accept, media=media, prompt_tokens=estimate)
+                break
+            except UpstreamStalled as error:
+                raise stalled(error) from None
+            except UpstreamGone as error:
+                # nothing reached the client yet: when the upstream died under this
+                # request, wait for its restart and run the request once more
+                if retry or not self._died_under_request():
+                    raise
+                print(f"[revive] {self.backend['label']} died under {request_id} ({error}); "
+                      "retrying after the restart", file=sys.stderr)
+                self._await_ready(cancelled)
         if first["cancel"]:
             self._telemetry_request(request_id, remove=True)
             self._record_telemetry("request_cancelled", request_id, error="CANCELLED")
@@ -5111,7 +5167,8 @@ class ProxyEngine(Engine):
                 sock.append(conn.sock)
                 response = conn.getresponse()
                 if response.status != 200:
-                    events.put(("error", self._upstream_error(response.status, response.read())))
+                    error = self._upstream_error(response.status, response.read())
+                    events.put(("error", UpstreamGone(str(error)) if response.status >= 500 else error))
                     return
                 events.put(("accept", None))
                 for line in iter(response.readline, b""):
@@ -5137,7 +5194,7 @@ class ProxyEngine(Engine):
         usage = None
         timings = None
         finish_reason = None
-        cancel = stop = False
+        cancel = stop = accepted = False
         guard = self.stall_base > 0
         last_progress = time.monotonic()
         limit = self.stall_deadline(prompt_tokens)
@@ -5158,11 +5215,18 @@ class ProxyEngine(Engine):
                         break
                     continue
                 if kind == "accept":
+                    accepted = True
                     if on_accept is not None:
                         on_accept({"prompt_tokens": None})   # commit the HTTP stream (#597 semantics)
                         on_accept = None
                     continue
                 elif kind == "data":
+                    error = value.get("error")
+                    if error:
+                        # vLLM ends the stream of a request whose engine died with an
+                        # error event; ignored, the reply ended as an empty normal stop
+                        message = error.get("message") if isinstance(error, dict) else str(error)
+                        raise RuntimeError(f"backend error in stream: {message or 'no detail'}")
                     last_progress = time.monotonic()
                     limit = self.stall_idle
                     if on_accept is not None:
@@ -5188,6 +5252,11 @@ class ProxyEngine(Engine):
                         break
                 elif kind == "done":
                     break
+                elif isinstance(value, ConnectionError):
+                    # the upstream refused or dropped the connection; the handler
+                    # treats ConnectionError as the client hanging up and sends nothing
+                    gone = RuntimeError if accepted else UpstreamGone
+                    raise gone(f"{self.backend['label']} connection failed: {value}") from value
                 else:
                     raise value
         finally:
