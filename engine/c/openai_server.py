@@ -527,8 +527,42 @@ def _native_tool_call(call):
     return "\n".join(lines) + "\n"
 
 
+# `[Calling tool: name({json})]` / `[Tool call: ...]`: the plain-text form oMLX's
+# text fallback writes past tool calls in; the model sometimes answers in it instead
+# of its native markup (2026-10-16: twice in a row, and the run was killed).
+QWEN38_TEXT_CALL_PREFIXES = ("[Calling tool:", "[Tool call:")
+_Q38_TEXT_CALL_RE = re.compile(r"\[(?:Calling tool|Tool call):\s*([A-Za-z0-9_.\-]+)\s*\(")
+_Q38_TEXT_CALL_END_RE = re.compile(r"\s*\)\s*\]")
+
+
+def _qwen38_text_calls(reply, declared):
+    """Calls in the plain-text form whose name is declared and whose argument is
+    one JSON object.  Returns (spans, calls); anything else stays text."""
+    decoder = json.JSONDecoder()
+    spans, calls = [], []
+    for match in _Q38_TEXT_CALL_RE.finditer(reply):
+        if (spans and match.start() < spans[-1][1]) or match.group(1) not in declared:
+            continue
+        start = match.end()
+        while start < len(reply) and reply[start].isspace():
+            start += 1
+        try:
+            args, end = decoder.raw_decode(reply, start)
+        except ValueError:
+            continue
+        close = _Q38_TEXT_CALL_END_RE.match(reply, end)
+        if not isinstance(args, dict) or close is None:
+            continue
+        spans.append((match.start(), close.end()))
+        calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                      "function": {"name": match.group(1),
+                                   "arguments": json.dumps(args, ensure_ascii=False)}})
+    return spans, calls
+
+
 def parse_qwen38_tool_calls(reply, tools=None):
-    """Parse the native <function=name>/<parameter=name> dialect."""
+    """Parse the native <function=name>/<parameter=name> dialect, and the
+    plain-text `[Calling tool: name({json})]` form when no native markup is there."""
     param_types = _tool_param_types(tools)
     declared = set(param_types)
     blocks = [match.group(1) for match in _Q38_CALL_RE.finditer(reply)]
@@ -572,8 +606,13 @@ def parse_qwen38_tool_calls(reply, tools=None):
                       "function": {"name": name,
                                    "arguments": json.dumps(args, ensure_ascii=False)}})
 
+    text_spans = []
+    if declared and BOX_START not in reply:
+        text_spans, calls = _qwen38_text_calls(reply, declared)
     marker_at = reply.find(BOX_START)
     text = reply[:marker_at] if marker_at >= 0 else reply
+    for begin, end in reversed(text_spans):
+        text = text[:begin] + text[end:]
     if THINK_CLOSE in text:
         text = text.split(THINK_CLOSE, 1)[1]
     text = text.replace(THINK_OPEN, "").replace(THINK_CLOSE, "")
@@ -586,10 +625,12 @@ def parse_qwen38_tool_calls(reply, tools=None):
                    n_markers, ", unclosed tail" if unclosed else ""))
         if rejected:
             line += " | rejected: " + "; ".join(rejected)
+        if text_spans:
+            line += " | plain-text form"
         if n_markers and not calls:
             excerpt = reply[marker_at:marker_at + 400].replace("\n", "\\n")
             line += " | excerpt: " + excerpt
-        elif not n_markers and len(reply) > 0:
+        elif not n_markers and not calls and len(reply) > 0:
             line += " | no markers, reply %d chars ending %r" % (len(reply), reply[-80:])
         sys.stderr.write(line + "\n")
         sys.stderr.flush()
@@ -753,6 +794,8 @@ def _tool_stream_markers():
         return ("<" + DSV4_DSML + "tool_calls", "<" + DSV4_DSML + "invoke")
     if ARCH == "kimi":
         return (K3_TOOLS_OPEN,)
+    if ARCH == "qwen38":
+        return (BOX_START,) + QWEN38_TEXT_CALL_PREFIXES
     return (BOX_START,)
 
 
@@ -769,6 +812,16 @@ def _tool_cut(buf):
 def _tool_hold():
     """Bytes to hold back while scanning for a tool-call marker split across chunks."""
     return max(len(m) for m in _tool_stream_markers()) - 1
+
+
+def _unclaimed_tool_text(held, tools):
+    """Stream text held back from a plain-text call prefix on that holds no
+    parseable call (prose that mentions the syntax): released as text, where
+    held native markup stays withheld."""
+    if not held.startswith(QWEN38_TEXT_CALL_PREFIXES):
+        return ""
+    spans, _calls = _qwen38_text_calls(held, set(_tool_param_types(tools)))
+    return "" if spans else held
 
 
 ARCH = "glm"   # set in main(): a family id from family_registry (glm | inkling |
@@ -4910,12 +4963,21 @@ class ProxyEngine(Engine):
         # (the chat path has no raw prompt to continue from: no budget on vLLM image turns)
         think_open = budget > 0 and prompt.rstrip().endswith("<think>") and chat is None
         state = {"in_think": think_open, "reason_tokens": 0, "tail": "", "cut": False,
-                 "text": [], "total": 0}
+                 "text": [], "total": 0, "exact": False}
+
+        def on_tokens(count):
+            # the upstream's own count for the chunk just streamed (vLLM's continuous
+            # usage): with MTP a chunk carries up to k+1 tokens, and counting chunks
+            # let an 8,192 budget run to ~31K tokens (2026-10-16)
+            state["exact"] = True
+            if state["in_think"]:
+                state["reason_tokens"] += count
 
         def on_text_counted(text):
             state["text"].append(text)
             if state["in_think"]:
-                state["reason_tokens"] += 1
+                if not state["exact"]:
+                    state["reason_tokens"] += 1
                 state["tail"] = (state["tail"] + text)[-32:]
                 if "</think>" in state["tail"]:
                     state["in_think"] = False
@@ -4944,7 +5006,8 @@ class ProxyEngine(Engine):
                 else:
                     first = self._stream_once(prompt, max_tokens, temperature, top_p, cache_slot, grammar,
                                               on_text_counted if think_open else on_text, cancelled,
-                                              budget_stop, on_accept, media=media, prompt_tokens=estimate)
+                                              budget_stop, on_accept, media=media, prompt_tokens=estimate,
+                                              on_tokens=on_tokens if think_open else None)
                 break
             except UpstreamStalled as error:
                 raise stalled(error) from None
@@ -5045,7 +5108,8 @@ class ProxyEngine(Engine):
         return stats
 
     def _stream_once(self, prompt, max_tokens, temperature, top_p, cache_slot, grammar,
-                     on_text, cancelled, stopped, on_accept=None, media=None, prompt_tokens=None):
+                     on_text, cancelled, stopped, on_accept=None, media=None, prompt_tokens=None,
+                     on_tokens=None):
         """One streamed upstream completion.  Returns the counters generate()
         folds into its stats; raises the upstream's error.  `media` (P6.5,
         llama.cpp) are the encoded images behind the prompt's MTMD markers."""
@@ -5056,6 +5120,8 @@ class ProxyEngine(Engine):
                 "top_k": SAMPLING_DEFAULTS[thinking]["top_k"]}
         if getattr(self, "_presence", None):
             body["presence_penalty"] = float(self._presence)
+        if on_tokens is not None and self.backend_id == "vllm":
+            body["stream_options"]["continuous_usage_stats"] = True    # usage on every chunk
         if self.backend_id == "llamacpp":
             body["cache_prompt"] = True
             body["id_slot"] = cache_slot
@@ -5096,7 +5162,7 @@ class ProxyEngine(Engine):
                 return out
 
         return self._stream_upstream(path, body, pieces, on_text, cancelled, stopped, on_accept,
-                                     prompt_tokens=prompt_tokens)
+                                     prompt_tokens=prompt_tokens, on_tokens=on_tokens)
 
     def _chat_once(self, chat, max_tokens, temperature, top_p, on_text, cancelled, stopped,
                    on_accept=None, prompt_tokens=None):
@@ -5156,7 +5222,7 @@ class ProxyEngine(Engine):
                                      stopped, on_accept, prompt_tokens=prompt_tokens)
 
     def _stream_upstream(self, path, body, pieces, on_text, cancelled, stopped, on_accept=None,
-                         prompt_tokens=None):
+                         prompt_tokens=None, on_tokens=None):
         events = queue.Queue()
         conn = self._connection()
         sock = []                 # the stream's socket, shut down to unblock the reader
@@ -5195,6 +5261,7 @@ class ProxyEngine(Engine):
         timings = None
         finish_reason = None
         cancel = stop = accepted = False
+        reported = 0              # completion tokens already passed to on_tokens
         guard = self.stall_base > 0
         last_progress = time.monotonic()
         limit = self.stall_deadline(prompt_tokens)
@@ -5234,6 +5301,10 @@ class ProxyEngine(Engine):
                         on_accept = None
                     if isinstance(value.get("usage"), dict):
                         usage = value["usage"]
+                        done = usage.get("completion_tokens")
+                        if on_tokens is not None and isinstance(done, int) and done > reported:
+                            on_tokens(done - reported)      # before the chunk's text: budget check
+                            reported = done
                     if isinstance(value.get("timings"), dict):
                         timings = value["timings"]
                     for piece in pieces(value):
@@ -6425,7 +6496,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 # Suppress tool-call markers from the streamed content and parse the authoritative
                 # calls from the FULL reply after generation. Hold back a marker-length tail so a
                 # tool-call marker split across engine chunks is still caught.
-                sp = {"buf": "", "tool": False}
+                sp = {"buf": "", "tool": False, "held": ""}
                 hold = _tool_hold()
                 raw = []
                 sideband = ToolSideband(ARCH == "kimi", stop_sequences,
@@ -6437,12 +6508,14 @@ class APIHandler(BaseHTTPRequestHandler):
                         emit(chunk)
                         return
                     if sp["tool"]:
+                        sp["held"] += chunk
                         return
                     sp["buf"] += chunk
                     cut = _tool_cut(sp["buf"])
                     if cut >= 0:
                         if cut:
                             emit(sp["buf"][:cut])
+                        sp["held"] = sp["buf"][cut:]
                         sp["buf"] = ""
                         sp["tool"] = True
                         return
@@ -6481,6 +6554,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     think.finish()
                 if not sp["tool"] and sp["buf"]:
                     emit(sp["buf"])                     # no tool call happened: flush held tail
+                elif sp["tool"] and _unclaimed_tool_text(sp["held"], tools):
+                    emit(sp["held"])
                 _content, calls = parse_arch_tool_calls("".join(raw), tools,
                                                         sideband.reply())
                 for i, tc in enumerate(calls):
@@ -6979,7 +7054,7 @@ class APIHandler(BaseHTTPRequestHandler):
             raw = []
             sideband = ToolSideband(ARCH == "kimi" and bool(tools), stop_sequences,
                                     ignore_leading_stop)
-            state = {"buf": "", "in_tool": False}
+            state = {"buf": "", "in_tool": False, "held": ""}
             hold = _tool_hold()
 
             def emit_text(chunk):
@@ -7000,12 +7075,14 @@ class APIHandler(BaseHTTPRequestHandler):
                     emit_text(chunk)
                     return
                 if state["in_tool"]:
+                    state["held"] += chunk
                     return                       # tool markers never reach the client as text
                 state["buf"] += chunk
                 cut = _tool_cut(state["buf"])
                 if cut >= 0:
                     if cut:
                         emit_text(state["buf"][:cut])
+                    state["held"] = state["buf"][cut:]
                     state["buf"] = ""
                     state["in_tool"] = True
                     return
@@ -7069,6 +7146,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 close_thinking()               # budget exhaustion before </think>
             if tools and not state["in_tool"] and state["buf"]:
                 emit_text(state["buf"])
+            elif tools and state["in_tool"] and _unclaimed_tool_text(state["held"], tools):
+                emit_text(state["held"])
             ka_stop.set()
             ka_thread.join(timeout=2)
             if stream_state["text_started"]:
@@ -7321,7 +7400,7 @@ class APIHandler(BaseHTTPRequestHandler):
             out_index = [0]
             st = {"reasoning_id": None, "reasoning_open": False, "reasoning_text": [],
                   "msg_id": None, "msg_open": False, "text": [],
-                  "buf": "", "in_tool": False}
+                  "buf": "", "in_tool": False, "held": ""}
             hold = _tool_hold()
 
             def open_reasoning():
@@ -7402,12 +7481,14 @@ class APIHandler(BaseHTTPRequestHandler):
                     emit_text(chunk)
                     return
                 if st["in_tool"]:
+                    st["held"] += chunk
                     return                       # tool markers never reach the client as text
                 st["buf"] += chunk
                 cut = _tool_cut(st["buf"])
                 if cut >= 0:
                     if cut:
                         emit_text(st["buf"][:cut])
+                    st["held"] = st["buf"][cut:]
                     st["buf"] = ""
                     st["in_tool"] = True
                     return
@@ -7449,6 +7530,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 split.close()
             if tools and not st["in_tool"] and st["buf"]:
                 emit_text(st["buf"])
+            elif tools and st["in_tool"] and _unclaimed_tool_text(st["held"], tools):
+                emit_text(st["held"])
             ka_stop.set()
             ka_thread.join(timeout=2)
             items, status, incomplete = finished_items("".join(raw), stats, sideband.reply())

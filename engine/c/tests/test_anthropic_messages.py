@@ -220,6 +220,26 @@ class MessagesHTTPTest(unittest.TestCase):
             "id": payload["content"][0]["id"], "name": "get_weather",
             "input": {"city": "Paris"}}])
 
+    def test_qwen38_plain_text_tool_call_becomes_tool_use(self):
+        call = '[Calling tool: get_weather({"city": "Paris"})]'
+        tools = [{"name": "get_weather", "input_schema": {
+            "type": "object", "properties": {"city": {"type": "string"}}}}]
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                self.engine.script = ("Checking.\n\n[Calli", call[6:20], call[20:])
+                with patch("openai_server.ARCH", "qwen38"):
+                    with self.post(self.base_body(tools=tools, stream=stream)) as response:
+                        raw = response.read().decode()
+                if stream:
+                    self.assertNotIn("Calling tool", raw)
+                    self.assertIn('"stop_reason":"tool_use"', raw.replace(" ", ""))
+                    self.assertIn('"name":"get_weather"', raw.replace(" ", ""))
+                else:
+                    payload = json.loads(raw)
+                    self.assertEqual(payload["stop_reason"], "tool_use")
+                    self.assertEqual([b["type"] for b in payload["content"]], ["text", "tool_use"])
+                    self.assertEqual(payload["content"][1]["input"], {"city": "Paris"})
+
     def test_x_api_key_and_bearer_both_authenticate(self):
         with self.post(self.base_body(), {"x-api-key": "secret"}) as response:
             self.assertEqual(response.status, 200)

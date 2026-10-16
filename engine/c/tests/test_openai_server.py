@@ -1865,6 +1865,72 @@ class HTTPTest(unittest.TestCase):
         self.assertEqual(json.loads(choice["message"]["tool_calls"][0]["function"]["arguments"]),
                          {"city": "Paris"})
 
+    def _qwen38_chunks(self, chunks, stream, tools):
+        """Run one Qwen3.8 chat request whose engine emits `chunks`; returns
+        (content, tool_calls, finish_reason) as the client sees them."""
+        def generate(_prompt, _maximum, _temperature, _top_p, on_text, _cache_slot=0,
+                     _cancelled=None, grammar=None, stopped=None, on_accept=None, **_kwargs):
+            if on_accept:
+                on_accept({"prompt_tokens": 10})
+            for chunk in chunks:
+                on_text(chunk)
+            return {"prompt_tokens": 10, "completion_tokens": 12, "length_limited": False}
+
+        with patch("openai_server.ARCH", "qwen38"), \
+                patch.object(self.engine, "generate", side_effect=generate):
+            with self.request("/v1/chat/completions", {
+                "model": "test-model", "messages": [{"role": "user", "content": "Go"}],
+                "tools": tools, "max_completion_tokens": 64, "stream": stream,
+            }) as response:
+                raw = response.read().decode()
+        if not stream:
+            choice = json.loads(raw)["choices"][0]
+            return (choice["message"]["content"] or "", choice["message"].get("tool_calls") or [],
+                    choice["finish_reason"])
+        payloads = [json.loads(line[6:]) for line in raw.splitlines()
+                    if line.startswith("data: ") and line != "data: [DONE]"]
+        deltas = [c.get("delta") or {} for p in payloads for c in p["choices"]]
+        calls = [t for d in deltas for t in d.get("tool_calls") or []]
+        finish = [c["finish_reason"] for p in payloads for c in p["choices"] if c.get("finish_reason")]
+        return "".join(d.get("content") or "" for d in deltas), calls, finish[-1]
+
+    def test_qwen38_plain_text_tool_call_form(self):
+        # 2026-10-16: the model wrote `[Calling tool: ipython({...})]` instead of its
+        # native markup, twice in a row, and the run was killed for repeating itself
+        tools = [{"type": "function", "function": {"name": "ipython", "parameters": {
+            "type": "object", "properties": {"code": {"type": "string"}}}}}]
+        code = "r = await bash(\"node --test x.js 2>&1 | tail -40\")\nprint(r.output[-3000:])\n"
+        call = "[Calling tool: ipython(" + json.dumps({"code": code}) + ")]"
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                content, calls, finish = self._qwen38_chunks(
+                    ["Running the tests.\n\n[Call", call[5:30], call[30:]], stream, tools)
+                self.assertEqual(content.strip(), "Running the tests.")
+                self.assertEqual(finish, "tool_calls")
+                self.assertEqual(calls[0]["function"]["name"], "ipython")
+                self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"code": code})
+                # prose that mentions the syntax stays text, also when streamed
+                prose = "Write calls as [Calling tool: name(args)] in the notes."
+                content, calls, finish = self._qwen38_chunks([prose[:20], prose[20:]], stream, tools)
+                self.assertEqual((content, calls, finish), (prose, [], "stop"))
+
+    def test_qwen38_plain_text_parser_edges(self):
+        from openai_server import parse_qwen38_tool_calls
+        tools = [{"type": "function", "function": {"name": "ipython", "parameters": {
+            "type": "object", "properties": {"code": {"type": "string"}}}}}]
+        text, calls = parse_qwen38_tool_calls(
+            'A\n[Tool call: ipython( {"code": "x = a[0](1)]"} )]\n[Calling tool: ipython({"code": "y"})]', tools)
+        self.assertEqual(text, "A")
+        self.assertEqual([json.loads(c["function"]["arguments"])["code"] for c in calls], ["x = a[0](1)]", "y"])
+        for reply in ('[Calling tool: shell({"cmd": "ls"})]',          # undeclared: stays text
+                      '[Calling tool: ipython({"code": "x"]',            # unterminated
+                      '[Calling tool: ipython(["x"])]'):                  # not an object
+            self.assertEqual(parse_qwen38_tool_calls(reply, tools), (reply, []))
+        native = ("<tool_call>\n<function=ipython>\n<parameter=code>\nz\n</parameter>\n"
+                  "</function>\n</tool_call>")
+        text, calls = parse_qwen38_tool_calls('[Calling tool: ipython({"code": "y"})]\n' + native, tools)
+        self.assertEqual([json.loads(c["function"]["arguments"]) for c in calls], [{"code": "z"}])
+
     def test_qwen38_speculative_decode_request_control(self):
         with patch("openai_server.ARCH", "qwen38"):
             with self.request("/v1/chat/completions", {
@@ -3242,14 +3308,17 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
             data = b"data: " + json.dumps(event).encode() + b"\n\n"
             self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
             self.wfile.flush()
-        for text in script["chunks"]:
-            emit({"choices": [{"index": 0, "text": text, "finish_reason": None}]})
+        per = script.get("tokens_per_chunk")                      # vLLM continuous usage (MTP chunks)
+        for i, text in enumerate(script["chunks"], 1):
+            emit({"choices": [{"index": 0, "text": text, "finish_reason": None}],
+                  **({"usage": {"prompt_tokens": script["prompt_tokens"], "completion_tokens": i * per}}
+                     if per else {})})
         prompt_text = body.get("prompt", "")
         if isinstance(prompt_text, dict):
             prompt_text = prompt_text.get("prompt_string", "")
         prompt_tokens = len(prompt_text) if script.get("prompt_tokens_per_char") else script["prompt_tokens"]
         emit({"choices": [{"index": 0, "text": "", "finish_reason": "stop"}],
-              "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": len(script["chunks"])},
+              "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": len(script["chunks"]) * (per or 1)},
               "timings": {"prompt_n": script["prompt_tokens"] - script.get("cache_n", 0),
                           "cache_n": script.get("cache_n", 0), "prompt_ms": 50.0,
                           "predicted_n": len(script["chunks"]), "predicted_ms": 100.0}})
@@ -3649,6 +3718,26 @@ class ProxyEngineTest(unittest.TestCase):
         self.assertEqual(stats["completion_tokens"], 2 + 4)
         events = [e for e in engine.telemetry_snapshot()["events"] if e["event"] == "generation_finished"]
         self.assertTrue(events[-1].get("reasoning_budget_cut"))
+        engine.close()
+
+    def test_reasoning_budget_counts_upstream_tokens_not_chunks(self):
+        # 2026-10-16: vLLM with MTP streams up to k+1 tokens per chunk; counting
+        # chunks let an 8,192 budget run to ~31K tokens and the conversation past
+        # the client's window
+        _UpstreamHandler.script = {"status": 200, "chunks": ("a", "b", "c", "d", "e", "f"),
+                                   "prompt_tokens": 7, "tokens_per_chunk": 4}
+        env = {"COLI_VLLM_CMD": "/bin/bash /srv/start_qwen.sh", "COLI_VLLM_MODEL": "/srv/models/q27",
+               "COLI_VLLM_PORT": str(self.upstream.server_address[1]), "COLI_VLLM_PREFIXES": self.slots.name}
+        with patch("openai_server.ARCH", "qwen38"):
+            engine = ProxyEngine("vllm", "qwen3.8-flash-next-aider", env=env, spawn=False)
+        engine.process = FakeProcess(lambda *_: None)
+        prompt = "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>"
+        engine.generate(prompt, 64, 0.0, 0.9, [].append, reasoning_budget=8)
+        streams = [b for p, b in _UpstreamHandler.seen if p == "/v1/completions" and b.get("stream")]
+        self.assertTrue(streams[0]["stream_options"]["continuous_usage_stats"])
+        self.assertEqual(len(streams), 2)                                 # cut at 2 chunks = 8 tokens
+        self.assertTrue(streams[1]["prompt"].startswith(prompt + "ab\n"))
+        self.assertNotIn("continuous_usage_stats", streams[1]["stream_options"])
         engine.close()
 
     def test_images_ride_the_completions_endpoint_when_a_projector_is_loaded(self):

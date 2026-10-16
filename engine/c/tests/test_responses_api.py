@@ -252,6 +252,29 @@ class ResponsesHTTPTest(unittest.TestCase):
         self.assertEqual([i["type"] for i in final["output"]], ["function_call"])
         self.assertEqual(final["status"], "completed")
 
+    def test_streaming_plain_text_tool_call_form(self):
+        tools = [{"type": "function", "name": "exec_command", "description": "run",
+                  "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}}]
+        call = '[Calling tool: exec_command({"cmd": "ls"})]'
+        prose = "Calls look like [Calling tool: name(args)] here."
+        for script, expect_call in (((call[:9], call[9:]), True), ((prose[:21], prose[21:]), False)):
+            with self.subTest(expect_call=expect_call):
+                self.start(FakeEngine(script))
+                with patch("openai_server.ARCH", "qwen38"), \
+                        self.post({"input": "list", "stream": True, "tools": tools,
+                                   "reasoning": {"effort": "none"}}) as r:
+                    evs = self.events(r.read().decode())
+                text = "".join(e["delta"] for e in evs if e["type"] == "response.output_text.delta")
+                calls = [e["item"] for e in evs if e["type"] == "response.output_item.done"
+                         and e["item"]["type"] == "function_call"]
+                if expect_call:
+                    self.assertEqual(text, "")
+                    self.assertEqual(json.loads(calls[0]["arguments"]), {"cmd": "ls"})
+                else:
+                    self.assertEqual((text, calls), (prose, []))
+                if expect_call:
+                    self.tearDown()                 # the next subtest starts its own server
+
     def test_namespaced_tool_call_carries_the_namespace_field(self):
         reply = ("<tool_call>\n<function=mcp__node_repl.js>\n<parameter=code>\n1+1\n</parameter>\n"
                  "</function>\n</tool_call>")
