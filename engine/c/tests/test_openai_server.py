@@ -17,7 +17,7 @@ from pathlib import Path
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import openai_server
-from openai_server import (_coerce_arg, ProxyImages, collect_proxy_images, proxy_chat_messages, anthropic_to_openai, _native_tool_call, APIError, APIHandler, APIServer, ClientCancelled, ProxyEngine,
+from openai_server import (saved_vllm_variant, _coerce_arg, ProxyImages, collect_proxy_images, proxy_chat_messages, anthropic_to_openai, _native_tool_call, APIError, APIHandler, APIServer, ClientCancelled, ProxyEngine,
                            backend_model_id, resolve_backend, saved_backend, saved_context_profile,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
@@ -3943,6 +3943,54 @@ class BackendSelectionTest(unittest.TestCase):
         self.assertEqual(command[command.index("-ctv") + 1], "q8_0")
         self.assertIn("--fit-target", command)
         plain.close(); long.close()
+
+    def test_vllm_variant_selects_the_model_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base, fable = Path(tmp) / "Qwen3.8-27B-base", Path(tmp) / "Fable-27B"
+            base.mkdir(); fable.mkdir()
+            catalog = f"base={base}|Qwen3.8 27B; fable={fable}|Fable 27B|max=167936; gone={tmp}/missing|Missing"
+            env = {"COLI_VLLM_CMD": "/bin/bash /srv/start_qwen.sh", "COLI_VLLM_MODEL": "/srv/models/q27",
+                   "COLI_VLLM_ENV": "PORT=8082 CTX=long MAX_LEN=131072", "COLI_VLLM_VARIANTS": catalog}
+            with patch("openai_server.ARCH", "qwen38"):
+                default = ProxyEngine("vllm", "qwen3.8-flash-next-aider", env=env, spawn=False)
+                chosen = ProxyEngine("vllm", "qwen3.8-flash-next-aider",
+                                     env=dict(env, COLI_VLLM_VARIANT="fable"), spawn=False)
+            self.assertEqual((default.child_env["MODEL"], default.backend["variant"], default.backend["model"]),
+                             (str(base), "base", "Qwen3.8-27B-base"))
+            self.assertEqual((chosen.child_env["MODEL"], chosen.backend["variant"]), (str(fable), "fable"))
+            # the variant's cap: 190K asked, 167,936 served and advertised; below the cap unchanged
+            with patch("openai_server.ARCH", "qwen38"):
+                wide = ProxyEngine("vllm", "qwen3.8-flash-next-aider",
+                                   env=dict(env, COLI_VLLM_VARIANT="fable", COLI_CONTEXT_PROFILE="vllm-190k"), spawn=False)
+                narrow = ProxyEngine("vllm", "qwen3.8-flash-next-aider",
+                                     env=dict(env, COLI_VLLM_VARIANT="fable", COLI_CONTEXT_PROFILE="standard"), spawn=False)
+            self.assertEqual((wide.context_window, wide.child_env["MAX_LEN"], wide.backend["context_window"]),
+                             (167936, "167936", 167936))
+            self.assertEqual((narrow.context_window, narrow.child_env["MAX_LEN"]), (131072, "131072"))
+            default.close(); chosen.close(); wide.close(); narrow.close()
+            path = Path(tmp) / "settings.json"
+            with patch.dict("os.environ", {"COLI_VLLM_CMD": "/bin/bash /srv/start_qwen.sh",
+                                           "COLI_VLLM_VARIANTS": catalog}):
+                server = APIServer(("127.0.0.1", 0), FakeEngine(), "test-model", settings_file=path)
+                try:
+                    payload = server.settings_payload()
+                    self.assertEqual(payload["vllm_variant"], "base")             # the first entry
+                    self.assertEqual(payload["vllm_variants"]["fable"],
+                                     {"label": "Fable 27B", "available": True, "max_context": 167936})
+                    self.assertFalse(payload["vllm_variants"]["gone"]["available"])
+                    self.assertEqual(server.update_settings({"vllm_variant": "fable"})["vllm_variant"], "fable")
+                    for bad in ("gone", "other"):
+                        with self.assertRaises(APIError):
+                            server.update_settings({"vllm_variant": bad})
+                finally:
+                    server.scheduler.close(); server.server_close()
+                self.assertEqual(saved_vllm_variant(path), "fable")
+                # other settings keep the choice
+                again = APIServer(("127.0.0.1", 0), FakeEngine(), "test-model", settings_file=path)
+                try:
+                    self.assertEqual(again.update_settings({"prepend_system_prompt": True})["vllm_variant"], "fable")
+                finally:
+                    again.scheduler.close(); again.server_close()
 
     def test_context_profile_setting_locks_the_backend(self):
         with tempfile.TemporaryDirectory() as tmp, \

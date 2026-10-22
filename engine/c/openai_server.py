@@ -4305,6 +4305,42 @@ def available_context_profiles(env=None):
             if info["backend"] is None or info["backend"] in backends}
 
 
+def vllm_variants(env=None):
+    """COLI_VLLM_VARIANTS: the 27B model directories the vLLM backend can start,
+    `id=path|label[|max=N]` entries separated by `;` (the first is the default).
+    The persisted `vllm_variant` setting picks one for the next restart; the
+    launcher receives it as MODEL.  `max` caps the window for a model whose KV
+    pool is smaller than a profile asks for (vLLM refuses to start otherwise)."""
+    raw = (os.environ if env is None else env).get("COLI_VLLM_VARIANTS", "")
+    out = {}
+    for item in raw.split(";"):
+        variant, _, rest = item.strip().partition("=")
+        fields = rest.split("|")
+        variant, path = variant.strip(), os.path.expanduser(fields[0].strip())
+        if not (variant and path):
+            continue
+        entry = {"path": path, "label": (fields[1].strip() if len(fields) > 1 else "") or variant,
+                 "max_context": None}
+        for extra in fields[2:]:
+            key, _, value = extra.strip().partition("=")
+            if key == "max" and value.strip().isdigit():
+                entry["max_context"] = int(value)
+        out[variant] = entry
+    return out
+
+
+def saved_vllm_variant(settings_file):
+    """The persisted `vllm_variant` choice, or None."""
+    if not settings_file:
+        return None
+    try:
+        saved = json.loads(Path(settings_file).expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    variant = saved.get("vllm_variant") if isinstance(saved, dict) else None
+    return variant if variant in vllm_variants() else None
+
+
 def saved_context_profile(settings_file):
     """The persisted `context_profile` choice (PATCH /v1/settings), or None."""
     if not settings_file:
@@ -4515,6 +4551,13 @@ class ProxyEngine(Engine):
                                     or LEGACY_VLLM_PROFILES.get(environ.get("COLI_VLLM_PROFILE")) or None)
             if self.context_profile == "long":
                 self.context_profile = "standard"
+            # 27B model variant (dashboard selection): the launcher's MODEL
+            variants = vllm_variants(environ)
+            self.variant = environ.get("COLI_VLLM_VARIANT")
+            if self.variant not in variants:
+                self.variant = next(iter(variants), None)
+            if self.variant is not None:
+                environ["MODEL"] = model = variants[self.variant]["path"]
             if self.context_profile in CONTEXT_PROFILES:
                 launcher = CONTEXT_PROFILES[self.context_profile]["vllm"]
                 environ["CTX"] = launcher["CTX"]
@@ -4522,6 +4565,12 @@ class ProxyEngine(Engine):
                 self.context_window = CONTEXT_PROFILES[self.context_profile]["context"]
             else:
                 self.context_profile = "fast" if environ.get("CTX", "fast") == "fast" else "standard"
+            cap = variants[self.variant]["max_context"] if self.variant is not None else None
+            if cap and self.context_window > cap:
+                print(f"[api] {self.variant}: window {self.context_window} capped to {cap} "
+                      f"(the model's KV pool)", file=sys.stderr)
+                self.context_window = cap
+                environ["MAX_LEN"] = str(cap)
             # P6.5: the launcher keeps the vision tower with VISION=1; image
             # turns then go to the upstream chat endpoint (its per-prompt image
             # limit is COLI_VLLM_IMAGES, the launcher's default is 1)
@@ -4540,6 +4589,7 @@ class ProxyEngine(Engine):
             shown = re.sub(r"-\d{5}-of-\d{5}$", "", re.sub(r"\.gguf$", "", shown))
         self.backend = {"id": backend, "label": BACKEND_LABELS[backend],
                         "model": shown,
+                        **({"variant": self.variant} if getattr(self, "variant", None) else {}),
                         "profile": self.context_profile,
                         "upstream": f"http://{self.host}:{self.port}",
                         "context_window": self.context_window, "images": self.images}
@@ -5502,6 +5552,7 @@ class APIServer(ThreadingHTTPServer):
         self.backend_id = "aider"            # the running backend (serve() sets it)
         self.backend_next = None             # persisted choice, applied by the next restart
         self.context_profile = None          # persisted context profile, applied by the next restart
+        self.vllm_variant = None             # persisted 27B model variant, applied by the next restart
         self.backend_error = None            # why the chosen backend is not the running one
         self._load_settings()
         self._conn_lock = threading.Lock()
@@ -5525,6 +5576,8 @@ class APIServer(ThreadingHTTPServer):
             self.backend_next = backend if backend in BACKEND_IDS else None
             profile = context_profile_from(saved)
             self.context_profile = profile if profile in CONTEXT_PROFILES else None
+            variant = saved.get("vllm_variant")
+            self.vllm_variant = variant if variant in vllm_variants() else None
             if isinstance(saved.get("api_defaults"), dict):
                 try:
                     self.api_defaults = {k: v for k, v in validate_api_defaults(saved["api_defaults"]).items()
@@ -5553,6 +5606,12 @@ class APIServer(ThreadingHTTPServer):
                 "context_profiles": {k: {"context": v["context"], "note": v["note"], "backend": v["backend"],
                                          "label": v.get("label") or k}
                                      for k, v in available_context_profiles().items()},
+                "vllm_variant": self.vllm_variant or next(iter(vllm_variants()), None),
+                "vllm_variant_active": (getattr(self.engine, "backend", None) or {}).get("variant")
+                                       if self.engine is not None else None,
+                "vllm_variants": {k: {"label": v["label"], "available": os.path.isdir(v["path"]),
+                                      "max_context": v["max_context"]}
+                                  for k, v in vllm_variants().items()},
                 "api_defaults": dict(self.api_defaults),
                 **({"backend_error": self.backend_error} if self.backend_error else {}),
             }
@@ -5561,7 +5620,7 @@ class APIServer(ThreadingHTTPServer):
         if not body:
             raise APIError(400, "At least one server setting is required.")
         unknown = set(body) - {"system_prompt", "prepend_system_prompt", "backend", "api_defaults",
-                               "context_profile", "vllm_profile"}
+                               "context_profile", "vllm_profile", "vllm_variant"}
         if unknown:
             raise APIError(400, f"Unsupported setting: {sorted(unknown)[0]}",
                            sorted(unknown)[0], "unsupported_parameter")
@@ -5601,6 +5660,16 @@ class APIServer(ThreadingHTTPServer):
                                         "context profile is selected; choose the standard profile first.",
                                    "backend", "invalid_value")
                 backend = locked
+            vllm_variant = self.vllm_variant
+            if "vllm_variant" in body:
+                vllm_variant = body["vllm_variant"]
+                variants = vllm_variants()
+                if vllm_variant not in variants:
+                    raise APIError(400, f"`vllm_variant` must be one of {', '.join(variants) or '(none configured)'}; "
+                                        "it applies at the next restart.", "vllm_variant", "invalid_value")
+                if not os.path.isdir(variants[vllm_variant]["path"]):
+                    raise APIError(400, f"The {vllm_variant} model directory is not installed.",
+                                   "vllm_variant", "invalid_value")
             api_defaults = dict(self.api_defaults)
             if "api_defaults" in body:
                 for key, value in validate_api_defaults(body["api_defaults"]).items():
@@ -5618,6 +5687,7 @@ class APIServer(ThreadingHTTPServer):
                         "backend": backend,
                         "api_defaults": api_defaults,
                         **({"context_profile": context_profile} if context_profile else {}),
+                        **({"vllm_variant": vllm_variant} if vllm_variant else {}),
                     }, ensure_ascii=False), encoding="utf-8")
                     temporary.chmod(0o600)
                     os.replace(temporary, self.settings_file)
@@ -5629,6 +5699,7 @@ class APIServer(ThreadingHTTPServer):
             self.prepend_system_prompt = enabled
             self.backend_next = backend
             self.context_profile = context_profile
+            self.vllm_variant = vllm_variant
             self.api_defaults = api_defaults
         return self.settings_payload()
 
@@ -7634,6 +7705,9 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
                 if profile:
                     proxy_env["COLI_CONTEXT_PROFILE"] = profile
                     proxy_env.pop("COLI_VLLM_PROFILE", None)
+                variant = saved_vllm_variant(os.environ.get("COLI_SETTINGS_FILE"))
+                if variant:
+                    proxy_env["COLI_VLLM_VARIANT"] = variant
                 runtime = ProxyEngine(backend, model_id, max_tokens, proxy_env, kv_slots, family)
             except Exception as error:
                 # a backend that cannot start must not take the service down

@@ -137,6 +137,11 @@ export interface ServerSettings {
   backend_locked?: string | null
   context_profile_active?: string | null
   context_profiles?: Record<string, { context: number; note: string; backend: string | null; label?: string }>
+  /** 27B model for the vLLM backend: the persisted choice (next start), the
+   *  running one, and the configured catalogue (COLI_VLLM_VARIANTS) */
+  vllm_variant?: string | null
+  vllm_variant_active?: string | null
+  vllm_variants?: Record<string, { label: string; available: boolean; max_context?: number | null }>
   /** dashboard "Extra": defaults for API clients that omit the field */
   api_defaults?: ApiDefaults
 }
@@ -357,6 +362,22 @@ export async function updateContextProfile(
     headers: headers(apiKey),
     signal,
     body: JSON.stringify({ context_profile: profile }),
+  })
+  if (!response.ok) throw new Error(await responseError(response))
+  return (await response.json()) as ServerSettings
+}
+
+export async function updateVllmVariant(
+  baseUrl: string,
+  apiKey: string,
+  variant: string,
+  signal?: AbortSignal,
+): Promise<ServerSettings> {
+  const response = await fetch(endpoint(baseUrl, "settings"), {
+    method: "PATCH",
+    headers: headers(apiKey),
+    signal,
+    body: JSON.stringify({ vllm_variant: variant }),
   })
   if (!response.ok) throw new Error(await responseError(response))
   return (await response.json()) as ServerSettings

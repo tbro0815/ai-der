@@ -36,7 +36,7 @@ import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { pickSuggestions } from "@/prompts"
 import { WEB_SEARCH_TOOLS, parseWebSearchResult } from "@/tools"
-import { type PrefillProgress, getHealth, getServerSettings, listModels, resetCache, restartServer, streamChat, updateApiDefaults, updateServerBackend, updateContextProfile, webSearch as webSearchCall, updateServerSettings, withSystemPrompt, type ChatMessage, type HealthResponse, type ServerSettings, type StreamChatResult } from "@/lib/api"
+import { type PrefillProgress, getHealth, getServerSettings, listModels, resetCache, restartServer, streamChat, updateApiDefaults, updateServerBackend, updateContextProfile, updateVllmVariant, webSearch as webSearchCall, updateServerSettings, withSystemPrompt, type ChatMessage, type HealthResponse, type ServerSettings, type StreamChatResult } from "@/lib/api"
 import { activeRequests, decodeTokensPerSecond, supportsCacheSlots } from "@/lib/runtime"
 import { Brain } from "./Brain"
 import { Profiling } from "./Profiling"
@@ -228,6 +228,17 @@ export default function App() {
     setSwitchingBackend(true)
     try {
       setServerSettings(await updateServerBackend(baseUrl, apiKey, backend))
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause))
+    } finally {
+      setSwitchingBackend(false)
+    }
+  }
+  const chooseVllmVariant = async (variant: string) => {
+    if (!serverSettings || variant === serverSettings.vllm_variant) return
+    setSwitchingBackend(true)
+    try {
+      setServerSettings(await updateVllmVariant(baseUrl, apiKey, variant))
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause))
     } finally {
@@ -773,6 +784,14 @@ export default function App() {
                 {Object.entries(serverSettings.context_profiles).map(([id, info]) => <option key={id} value={id}>{info.label && info.label !== id ? info.label : `${id} · ${Math.round(info.context / 1024)}K${info.backend ? ` · ${backendLabel(info.backend)}` : ""}`}</option>)}
               </select>
               <span className="field-help">{serverSettings.context_profile_active && serverSettings.context_profile_active !== (serverSettings.context_profile || "standard") ? t("sidebar.contextProfilePending") : t("sidebar.contextProfileHelp")}</span>
+            </label>
+          ) : null}
+          {serverSettings?.vllm_variants && Object.keys(serverSettings.vllm_variants).length > 1 ? (
+            <label className="backend-choice">{t("sidebar.vllmVariant")}
+              <select value={serverSettings.vllm_variant || ""} disabled={switchingBackend} onChange={(event) => void chooseVllmVariant(event.target.value)}>
+                {Object.entries(serverSettings.vllm_variants).map(([id, info]) => <option key={id} value={id} disabled={!info.available}>{info.label}{info.max_context ? ` · ${t("sidebar.vllmVariantMax", { k: Math.round(info.max_context / 1024) })}` : ""}{info.available ? "" : ` (${t("sidebar.vllmVariantMissing")})`}</option>)}
+              </select>
+              <span className="field-help">{serverSettings.vllm_variant_active && serverSettings.vllm_variant_active !== serverSettings.vllm_variant ? t("sidebar.vllmVariantPending") : t("sidebar.vllmVariantHelp")}</span>
             </label>
           ) : null}
           {restartSupported ? (
