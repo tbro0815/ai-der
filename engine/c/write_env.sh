@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AI-DER: write ai-der.env (the serving environment for all three backends) into the checkout
+# AI-DER: write ai-der.env (the serving environment for all four backends) into the checkout
 # and, with --systemd, a user unit at ~/.config/systemd/user/ai-der.service.
 # Called by ../../install.sh; runnable alone: AI_DER_DATA=~/ai-der-data engine/c/write_env.sh [--systemd]
 set -euo pipefail
@@ -9,6 +9,7 @@ container=$data/models/qwen38-container
 gguf_dir=$data/models/qwen38-flash-next
 llamacpp=$data/llama.cpp/build/bin/llama-server
 vllm_dir=$data/vllm/qwen38-27b-rtx3090
+strata_dir=$data/strata
 env_file=$root/ai-der.env
 threads=$(( $(nproc) / 2 )); (( threads >= 4 )) || threads=4
 say() { echo "AI-DER env: $*"; }
@@ -17,6 +18,7 @@ say() { echo "AI-DER env: $*"; }
 cat <<EOF
 # AI-DER serving environment, written by install.sh on $(date +%F). Edit freely; rerun
 # engine/c/write_env.sh to regenerate. Load it with:  set -a; source ai-der.env; set +a
+# (values with spaces are double-quoted: bash's source and systemd's EnvironmentFile both read them)
 # ---- AI-DER engine (Qwen3.8-Flash-Next container) ----
 COLI_CUDA=1
 CUDA_EXPERT_GB=auto
@@ -43,22 +45,38 @@ if [[ -x $llamacpp ]]; then cat <<EOF
 # ---- llama.cpp backend ----
 COLI_LLAMACPP_SERVER=$llamacpp
 COLI_LLAMACPP_MODEL=$gguf_dir/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf
-COLI_LLAMACPP_ARGS=-c 131072 -fa on -ctk q8_0 -ctv q8_0 --fit-target 256 -b 2048 -ub 512 --mmproj $gguf_dir/mmproj-F16.gguf
+COLI_LLAMACPP_ARGS="-c 131072 -fa on -ctk q8_0 -ctv q8_0 -cmoe --moe-cache-mib 12000 -b 2048 -ub 512 --mmproj $gguf_dir/mmproj-F16.gguf"
 COLI_LLAMACPP_SLOTS=$HOME/.cache/ai-der/llamacpp-slots
 EOF
 else echo "# llama.cpp backend not installed (engine/c/install_llamacpp.sh)"; fi
 if [[ -x $vllm_dir/venv/bin/python && -d $vllm_dir/models/Qwen3.8-27B-W4A16-AutoRound-fast ]]; then cat <<EOF
 # ---- vLLM backend (Qwen3.8-27B W4A16 stack) ----
-COLI_VLLM_CMD=/bin/bash $vllm_dir/single-user/start_qwen.sh
+COLI_VLLM_CMD="/bin/bash $vllm_dir/single-user/start_qwen.sh"
 COLI_VLLM_MODEL=$vllm_dir/models/Qwen3.8-27B-W4A16-AutoRound-fast
 COLI_VLLM_MODEL_ID=qwen3.8-27b
 COLI_VLLM_PORT=8082
 COLI_VLLM_CONTEXT=131072
-COLI_VLLM_ENV=PORT=8082 HOST=127.0.0.1 CTX=long MAX_LEN=131072 SPEC=mtp PREFIX_CACHE=1 MAX_SEQS=1 VISION=1 VLLM_SERVER_DEV_MODE=1 'EXTRA_ARGS=--limit-mm-per-prompt {"image":{"count":4}}'
+COLI_VLLM_ENV="PORT=8082 HOST=127.0.0.1 CTX=long MAX_LEN=131072 SPEC=mtp PREFIX_CACHE=1 MAX_SEQS=1 VISION=1 VLLM_SERVER_DEV_MODE=1 'EXTRA_ARGS=--limit-mm-per-prompt {\"image\":{\"count\":4}}'"
 COLI_VLLM_IMAGES=4
 COLI_VLLM_PREFIXES=$HOME/.cache/ai-der/vllm-prefixes
 EOF
 else echo "# vLLM backend not installed (engine/c/install_vllm.sh)"; fi
+strata_variants=""
+for entry in "gsq-iq3s=strata-iq3_s.json|Qwen3.8-Flash-Next GSQ-RCO IQ3_S" \
+             "uncensored-iq3s=strata-uncensored-i1-iq3_s.json|Qwen3.8-Flash-Next Uncensored i1-IQ3_S (OrcaRouter, mradermacher)" \
+             "ud-iq4xs=strata-unsloth-ud-iq4_xs.json|Qwen3.8-Flash-Next UD-IQ4_XS (unsloth)"; do
+    id=${entry%%=*}; rest=${entry#*=}; file=${rest%%|*}; label=${rest#*|}
+    if [[ -f $strata_dir/$file ]]; then strata_variants+="${strata_variants:+;}$id=$strata_dir/$file|$label"; fi
+done
+if [[ -x $strata_dir/.venv/bin/python && -n $strata_variants ]]; then cat <<EOF
+# ---- Strata backend (Qwen3.8-Flash-Next; models: id=strata-<model>.json|label, the first is the default) ----
+COLI_STRATA_CMD="$strata_dir/.venv/bin/python $strata_dir/serve/server.py --engine strata"
+COLI_STRATA_PORT=8084
+COLI_STRATA_DIR=$strata_dir
+COLI_STRATA_RUNTIME=$HOME/.cache/ai-der/strata
+COLI_STRATA_VARIANTS="$strata_variants"
+EOF
+else echo "# Strata backend not installed (engine/c/install_strata.sh)"; fi
 cat <<EOF
 # ---- LAN serving (off by default; see README) ----
 # COLI_API_KEY=change-me

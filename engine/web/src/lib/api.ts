@@ -133,15 +133,15 @@ export interface ServerSettings {
   /** context profile (fast 80K | standard 131K | vllm-190k | long 262K): the persisted
    *  choice (next start), the running one, the catalogue of selectable ones */
   context_profile?: string
-  /** set while a profile holds the next backend (fast, vllm-190k: vllm; long: llamacpp) */
+  /** the engines the selected profile allows (null: every engine) */
+  backends_allowed?: string[] | null
+  /** the single engine a profile allows, else null (older dashboards) */
   backend_locked?: string | null
   context_profile_active?: string | null
-  context_profiles?: Record<string, { context: number; note: string; backend: string | null; label?: string }>
-  /** 27B model for the vLLM backend: the persisted choice (next start), the
-   *  running one, and the configured catalogue (COLI_VLLM_VARIANTS) */
-  vllm_variant?: string | null
-  vllm_variant_active?: string | null
-  vllm_variants?: Record<string, { label: string; available: boolean; max_context?: number | null }>
+  context_profiles?: Record<string, { context: number; note: string; backends: string[] | null; label?: string }>
+  /** model per engine: the persisted choice (next start), the running one, the catalogue */
+  variants?: Record<string, { selected: string | null; active: string | null;
+                               options: Record<string, { label: string; available: boolean; max_context?: number | null }> }>
   /** dashboard "Extra": defaults for API clients that omit the field */
   api_defaults?: ApiDefaults
 }
@@ -367,9 +367,10 @@ export async function updateContextProfile(
   return (await response.json()) as ServerSettings
 }
 
-export async function updateVllmVariant(
+export async function updateVariant(
   baseUrl: string,
   apiKey: string,
+  engine: string,
   variant: string,
   signal?: AbortSignal,
 ): Promise<ServerSettings> {
@@ -377,7 +378,7 @@ export async function updateVllmVariant(
     method: "PATCH",
     headers: headers(apiKey),
     signal,
-    body: JSON.stringify({ vllm_variant: variant }),
+    body: JSON.stringify({ [`${engine}_variant`]: variant }),
   })
   if (!response.ok) throw new Error(await responseError(response))
   return (await response.json()) as ServerSettings

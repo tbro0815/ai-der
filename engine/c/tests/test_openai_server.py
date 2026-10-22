@@ -17,7 +17,7 @@ from pathlib import Path
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import openai_server
-from openai_server import (saved_vllm_variant, _coerce_arg, ProxyImages, collect_proxy_images, proxy_chat_messages, anthropic_to_openai, _native_tool_call, APIError, APIHandler, APIServer, ClientCancelled, ProxyEngine,
+from openai_server import (saved_vllm_variant, saved_variant, _coerce_arg, ProxyImages, collect_proxy_images, proxy_chat_messages, anthropic_to_openai, _native_tool_call, APIError, APIHandler, APIServer, ClientCancelled, ProxyEngine,
                            backend_model_id, resolve_backend, saved_backend, saved_context_profile,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
@@ -3771,6 +3771,78 @@ class ProxyEngineTest(unittest.TestCase):
         self.assertEqual((finished["prompt_tokens"], finished["cached_tokens"], finished["prefilled_tokens"]), (7, 4, 3))
         engine.close()
 
+    def _strata_env(self, tmp):
+        cfg = {"exe": "/srv/strata/engine/strata", "cwd": "/srv/strata",
+               "args": ["--pack", "/p", "--native", "/m.gguf", "--max-context", "262144", "--kv", "int8", "--vision"],
+               "vision": {"exe": "/srv/strata/engine/strata-vision"}, "model_name": "qwen3.8-flash-next-unsloth-ud-iq4_xs",
+               "port": 8084}
+        Path(tmp, "ud.json").write_text(json.dumps(cfg))
+        Path(tmp, "gsq.json").write_text(json.dumps(dict(cfg, model_name="qwen3.8-flash-next-iq3_s")))
+        return {"COLI_STRATA_CMD": "/srv/strata/.venv/bin/python /srv/strata/serve/server.py --engine strata",
+                "COLI_STRATA_PORT": str(self.upstream.server_address[1]), "COLI_STRATA_RUNTIME": tmp,
+                "COLI_STRATA_VARIANTS": f"gsq={tmp}/gsq.json|GSQ-RCO IQ3_S; ud={tmp}/ud.json|UD-IQ4_XS; "
+                                        f"gone={tmp}/missing.json|Missing"}
+
+    def test_strata_starts_from_a_per_profile_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._strata_env(tmp)
+            with patch("openai_server.ARCH", "qwen38"):
+                standard = ProxyEngine("strata", "qwen3.8-flash-next-aider", env=env, spawn=False)
+                long = ProxyEngine("strata", "qwen3.8-flash-next-aider",
+                                   env=dict(env, COLI_CONTEXT_PROFILE="long", COLI_STRATA_VARIANT="ud"), spawn=False)
+                fast = ProxyEngine("strata", "qwen3.8-flash-next-aider",
+                                   env=dict(env, COLI_CONTEXT_PROFILE="fast"), spawn=False)
+            for engine, variant, window in ((standard, "gsq", 131072), (long, "ud", 262144), (fast, "gsq", 131072)):
+                self.assertEqual((engine.backend["variant"], engine.context_window, engine.backend["context_window"]),
+                                 (variant, window, window))
+                derived = engine.command[engine.command.index("--config") + 1]
+                cfg = json.loads(Path(derived).read_text())
+                args = cfg["args"]
+                self.assertEqual(args[args.index("--max-context") + 1], str(window))
+                self.assertEqual(args.count("--max-context"), 1)
+                self.assertTrue(cfg["fit_max_tokens"])
+                self.assertEqual(cfg["port"], int(env["COLI_STRATA_PORT"]))
+                self.assertEqual(engine.command[:4], ["/srv/strata/.venv/bin/python", "/srv/strata/serve/server.py",
+                                                      "--engine", "strata"])
+                self.assertEqual(engine.cwd, "/srv/strata")
+                self.assertTrue(engine.images)
+                self.assertFalse(engine.supports_cache_reset)
+                engine.close()
+            self.assertEqual(long.backend["profile"], "long")
+            self.assertEqual(fast.backend["profile"], "standard")      # fast is vLLM-only
+            # readiness: Strata's /health is 200 at once, max_context > 0 once loaded
+            self.assertFalse(standard._health_ready(b'{"status": "ok", "max_context": 0}'))
+            self.assertTrue(standard._health_ready(b'{"status": "ok", "max_context": 131072}'))
+
+    def test_strata_turns_take_the_chat_path_with_effort_and_budget(self):
+        _UpstreamHandler.script = {
+            "status": 200, "prompt_tokens": 40, "cache_n": 12,
+            "chat_deltas": [{"reasoning_content": "think "}, {"content": "Answer."}], "chat_finish": "stop"}
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("openai_server.ARCH", "qwen38"):
+                engine = ProxyEngine("strata", "qwen3.8-flash-next-aider", env=self._strata_env(tmp), spawn=False)
+            engine.process = FakeProcess(lambda *_: None)
+            messages, image = engine.prepare_images(
+                [{"role": "system", "content": "s"}, {"role": "user", "content": "q"}], None, None, True, "xhigh")
+            self.assertEqual(image.media, [])                       # text-only turns carry the chat too
+            out = []
+            stats = engine.generate("<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n<think>\n",
+                                    64, 0.0, 0.9, out.append, image=image, reasoning_budget=128)
+            request = [b for p, b in _UpstreamHandler.seen if p == "/v1/chat/completions"][-1]
+            self.assertEqual(request["chat_template_kwargs"], {"enable_thinking": True, "reasoning_effort": "xhigh"})
+            self.assertEqual(request["reasoning_budget_tokens"], 128)
+            self.assertEqual(request["model"], "qwen3.8-flash-next-iq3_s")
+            self.assertEqual([m["role"] for m in request["messages"]], ["system", "user"])
+            self.assertEqual("".join(out), "think </think>Answer.")
+            self.assertEqual(stats["prompt_tokens"], 40)
+            # thinking off: no effort, no budget
+            _, image = engine.prepare_images([{"role": "user", "content": "q"}], None, None, False, None)
+            engine.generate("x", 8, 0.0, 0.9, lambda _: None, image=image)
+            request = [b for p, b in _UpstreamHandler.seen if p == "/v1/chat/completions"][-1]
+            self.assertEqual(request["chat_template_kwargs"], {"enable_thinking": False})
+            self.assertNotIn("reasoning_budget_tokens", request)
+            engine.close()
+
     def test_vllm_image_turns_use_the_chat_endpoint_and_native_text(self):
         _UpstreamHandler.script = {
             "status": 200, "prompt_tokens": 40, "cache_n": 0,
@@ -3992,6 +4064,44 @@ class BackendSelectionTest(unittest.TestCase):
                 finally:
                     again.scheduler.close(); again.server_close()
 
+    def test_long_profile_keeps_either_of_its_engines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "s.json"; cfg.write_text("{}")
+            env = {"COLI_VLLM_CMD": "/bin/bash /srv/start_qwen.sh", "COLI_LLAMACPP_MODEL": "/models/x.gguf",
+                   "COLI_STRATA_CMD": "/srv/strata/serve", "COLI_STRATA_VARIANTS": f"gsq={cfg}|GSQ"}
+            path = Path(tmp) / "settings.json"
+            with patch.dict("os.environ", env):
+                server = APIServer(("127.0.0.1", 0), FakeEngine(), "test-model", settings_file=path)
+                try:
+                    self.assertEqual(server.settings_payload()["context_profiles"]["long"]["backends"],
+                                     ["llamacpp", "strata"])
+                    payload = server.update_settings({"backend": "strata"})
+                    self.assertEqual(payload["backends_allowed"], None)
+                    payload = server.update_settings({"context_profile": "long"})
+                    # Strata serves long: it stays; nothing is locked to a single engine
+                    self.assertEqual((payload["backend_next"], payload["backends_allowed"], payload["backend_locked"]),
+                                     ("strata", ["llamacpp", "strata"], None))
+                    self.assertEqual(server.update_settings({"backend": "llamacpp"})["backend_next"], "llamacpp")
+                    with self.assertRaises(APIError):
+                        server.update_settings({"backend": "vllm"})
+                    # fast moves the next backend to vLLM, the only engine that serves it
+                    payload = server.update_settings({"context_profile": "fast"})
+                    self.assertEqual((payload["backend_next"], payload["backend_locked"]), ("vllm", "vllm"))
+                    # per-engine model choice
+                    payload = server.update_settings({"strata_variant": "gsq"})
+                    self.assertEqual(payload["variants"]["strata"]["selected"], "gsq")
+                    self.assertEqual(payload["variants"]["strata"]["options"]["gsq"]["available"], True)
+                    with self.assertRaises(APIError):
+                        server.update_settings({"strata_variant": "other"})
+                finally:
+                    server.scheduler.close(); server.server_close()
+                self.assertEqual(saved_variant(path, "strata"), "gsq")
+                # long selected on disk with a backend outside its set: the next start takes the first engine
+                path.write_text(json.dumps({"backend": "vllm", "context_profile": "long"}))
+                self.assertEqual(resolve_backend(None, path), "llamacpp")
+                path.write_text(json.dumps({"backend": "strata", "context_profile": "long"}))
+                self.assertEqual(resolve_backend(None, path), "strata")
+
     def test_context_profile_setting_locks_the_backend(self):
         with tempfile.TemporaryDirectory() as tmp, \
              patch.dict("os.environ", {"COLI_VLLM_CMD": "/bin/bash /srv/start_qwen.sh",
@@ -4001,9 +4111,9 @@ class BackendSelectionTest(unittest.TestCase):
             try:
                 first = server.settings_payload()
                 self.assertEqual(first["context_profile"], "standard")
-                self.assertEqual({k: (v["context"], v["backend"]) for k, v in first["context_profiles"].items()},
-                                 {"fast": (81920, "vllm"), "standard": (131072, None),
-                                  "long": (262144, "llamacpp"), "vllm-190k": (190464, "vllm")})
+                self.assertEqual({k: (v["context"], v["backends"]) for k, v in first["context_profiles"].items()},
+                                 {"fast": (81920, ["vllm"]), "standard": (131072, None),
+                                  "long": (262144, ["llamacpp"]), "vllm-190k": (190464, ["vllm"])})
                 self.assertEqual(first["context_profiles"]["vllm-190k"]["label"], "vLLM 190K")
                 payload = server.update_settings({"context_profile": "vllm-190k"})
                 self.assertEqual((payload["backend_next"], payload["backend_locked"]), ("vllm", "vllm"))

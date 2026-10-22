@@ -1,4 +1,4 @@
-# AI-DER 1.3.5
+# AI-DER 1.4.0
 
 **Artificial Intelligence Distributed Engram Runner** is a local inference runner
 for Qwen3.8-Flash-Next quantized mixture-of-experts models. It combines SSD-backed
@@ -15,9 +15,10 @@ Qwen3.8 engine, container converter, GPU routing and inference kernels.
 - PC running **Ubuntu 24.04 or 26.04 LTS, x86_64**, with a CUDA-compatible NVIDIA driver.
 - **128 GB RAM**, DDR4 or newer.
 - **NVIDIA RTX 3090 or RTX 3090 Ti**, 24 GB VRAM.
-- **PCIe 4.x or newer NVMe SSD as the system drive**, with about **230 GB free** for
+- **PCIe 4.x or newer NVMe SSD as the system drive**, with about **410 GB free** for
   the full installation (weights 95 GB, engine container 61 GB, MTP draft 8 GB,
-  vLLM stack and weights 40 GB, llama.cpp 3 GB). Keep the data directory on NVMe.
+  vLLM stack and weights 40 GB, llama.cpp 3 GB, CUDA 13 toolkit 4 GB, Strata and its
+  two IQ3_S models 180 GB). Keep the data directory on NVMe.
 - **CUDA Toolkit 12.4 or newer**, including `nvcc`, CUDA runtime and cuBLAS.
 - Internet access and sudo rights for installation. Model weights are downloaded
   from Hugging Face under their own licenses.
@@ -38,7 +39,7 @@ sudo apt-get update
 sudo apt-get install -y git
 git clone https://github.com/tbro0815/ai-der.git
 cd ai-der
-git checkout v1.3.5
+git checkout v1.4.0
 ./install.sh --check
 ./install.sh
 ```
@@ -55,18 +56,29 @@ Run the installer as your normal user. The default installation does everything:
    template (Qwen), the MTP draft tensors fetched by HTTP range requests, then the
    engine container conversion and the MTP container (BF16 to Q8_0). Tens of
    minutes after the download; every step resumes on rerun.
-3. **llama.cpp backend** (`engine/c/install_llamacpp.sh`): `llama-server` built with
-   CUDA at a pinned revision.
-4. **vLLM backend** (`engine/c/install_vllm.sh`): the syv-ai HyperQwen stack (Qwen3.8-27B
+3. **CUDA 13 toolkit** (`engine/c/install_cuda13.sh`): NVIDIA's pip wheels assembled
+   into `~/ai-der-data/cuda13` for the llama.cpp and Strata builds; the system toolkit
+   is left alone. On glibc 2.41+ (Ubuntu 26.04) the view carries a private copy of
+   `crt/math_functions.h` whose `rsqrt`/`rsqrtf` declarations match glibc's.
+4. **llama.cpp backend** (`engine/c/install_llamacpp.sh`): `llama-server` built with
+   CUDA at a pinned revision that carries the MoE expert cache (`-cmoe
+   --moe-cache-mib 12000`: every expert in RAM, the hot ones in VRAM).
+5. **vLLM backend** (`engine/c/install_vllm.sh`): the syv-ai HyperQwen stack (Qwen3.8-27B
    on vLLM 0.31.0) at a pinned revision in its own Python 3.12 venv, the published W4A16 weights, the
    one-time CPU preparation (int8 heads, int8 MTP draft, draft vocabulary, fast
    variant) and the stack's vLLM patches.
-5. **`ai-der.env`** in the checkout: the serving environment for all installed
+6. **Strata backend** (`engine/c/install_strata.sh`): [Strata](https://github.com/Niko1221/Strata),
+   an inference engine for Qwen3.8-Flash-Next, built from source at a pinned revision,
+   with three models: ISTA-DASLab's GSQ-RCO IQ3_S pack, mradermacher's i1-IQ3_S of
+   OrcaRouter's Qwen3.8-Flash-Next-Uncensored (packed with Strata's `iq_pack.py
+   --compat-bf16`) and the UD-IQ4_XS GGUF from step 2. `AI_DER_STRATA_MODELS=gsq,uncensored,ud`
+   picks a subset.
+7. **`ai-der.env`** in the checkout: the serving environment for all installed
    backends. `--systemd` also writes `~/.config/systemd/user/ai-der.service`.
 
 Everything lands under `~/ai-der-data` (`--data-dir DIR` changes it). Flags:
 `--core-only` installs the engine and dashboard only, `--skip-models`,
-`--skip-llamacpp` and `--skip-vllm` drop one component, `--no-apt` skips the sudo
+`--skip-llamacpp`, `--skip-vllm` and `--skip-strata` drop one component, `--no-apt` skips the sudo
 step on a provisioned host. Keep the checkout in place: the editable command runs
 its engine sources here. The full download-and-convert path is long (an hour or
 more, dominated by the 95 GB download and the conversion) and was assembled from
@@ -82,11 +94,12 @@ set -a; source ai-der.env; set +a
 ```
 
 Open `http://127.0.0.1:8080` in a browser for the dashboard; the API base URL is
-`http://127.0.0.1:8080/v1`. The default backend is AI-DER; the Extra section of
-the dashboard switches to llama.cpp or vLLM at the next restart and selects the
-context profile: `standard` (131K, every backend), `fast` (80K, vLLM only),
-`vllm-190k` (190K, vLLM only) or `long` (262K, llama.cpp only). A profile served
-by one backend locks the backend to it until `standard` is selected again.
+`http://127.0.0.1:8080/v1`. The default backend is AI-DER. The Extra section of the
+dashboard selects, for the next restart, the context profile first: `standard`
+(131K, every engine), `fast` (80K, vLLM only), `vllm-190k` (190K, vLLM only) or
+`long` (262K, llama.cpp or Strata). The engine list then offers the engines that
+serve that profile, and the model list the models of the chosen engine (vLLM's
+27B models, Strata's three).
 With `--systemd`: `systemctl --user enable --now ai-der.service`.
 
 **Web search in the chat.** Enter a [Serper](https://serper.dev) API key in the
@@ -124,7 +137,7 @@ Qwen repository and `engine/c/convert_mtp.py` writes `<container>/mtp`.
 Python package metadata and `ai-der --version` (`coli` remains an alias).
 Use semantic versioning: MAJOR for incompatible changes, MINOR for compatible
 features, PATCH for fixes. Releases are tagged `vMAJOR.MINOR.PATCH`; this release
-is **v1.3.5**. Internal upstream component metadata is independent.
+is **v1.4.0**. Internal upstream component metadata is independent.
 
 ```bash
 .venv/bin/ai-der --version

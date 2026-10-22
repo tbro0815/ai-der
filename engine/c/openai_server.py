@@ -4234,8 +4234,8 @@ class Engine:
 # scheduler, telemetry and dashboard are shared; only the token producer
 # differs.  The active backend is visible in /health `backend`, in the
 # telemetry `runtime.backend` field and in /v1/settings.
-BACKEND_IDS = ("aider", "llamacpp", "vllm")
-BACKEND_LABELS = {"aider": "AI-DER", "llamacpp": "llama.cpp", "vllm": "vLLM"}
+BACKEND_IDS = ("aider", "llamacpp", "vllm", "strata")
+BACKEND_LABELS = {"aider": "AI-DER", "llamacpp": "llama.cpp", "vllm": "vLLM", "strata": "Strata"}
 BACKEND_ALIASES = {"colibri": "aider"}        # pre-rename settings files
 
 
@@ -4251,6 +4251,8 @@ def backend_configured(backend, env=None):
         return bool(env.get("COLI_LLAMACPP_MODEL"))
     if backend == "vllm":
         return bool(env.get("COLI_VLLM_CMD"))
+    if backend == "strata":
+        return bool(env.get("COLI_STRATA_CMD")) and bool(model_variants("strata", env))
     return False
 
 
@@ -4262,24 +4264,25 @@ def available_backends(env=None):
 # window at the next restart.  `standard` (131K) is the one-context contract every
 # backend serves.  `fast` (80K, vLLM launcher CTX=fast), `vllm-190k` (vLLM's fp8
 # KV pool used to its safe size) and `long` (262K, the model's native length,
-# llama.cpp with a q8_0 KV cache) each knowingly leave that contract while
-# selected and lock the backend to the one that serves them.
+# llama.cpp with a q8_0 KV cache or Strata) each knowingly leave that contract
+# while selected; `backends` names the engines that serve a profile (None: every
+# engine), and the backend for the next start is held inside that set.
 CONTEXT_PROFILES = {
     # 80K: the bf16 KV pool holds 85,196 tokens with the vision tower on
     # (vLLM log, 2026-09-27); the launcher's own default is 64K
-    "fast": {"context": 81920, "backend": "vllm",
+    "fast": {"context": 81920, "backends": ("vllm",),
              "vllm": {"CTX": "fast", "MAX_LEN": "81920"},
              "note": "vLLM only: 80K window, bf16 KV cache, ~111-157 tok/s decode"},
-    "standard": {"context": 131072, "backend": None,
+    "standard": {"context": 131072, "backends": None,
                  "vllm": {"CTX": "long", "MAX_LEN": "131072"},
                  "note": "every backend: 131K window"},
-    "long": {"context": 262144, "backend": "llamacpp",
-             "note": "llama.cpp only: 262K window (the model's native length), q8_0 KV cache"},
+    "long": {"context": 262144, "backends": ("llamacpp", "strata"),
+             "note": "llama.cpp or Strata: 262K window (the model's native length)"},
     # the standard fp8 launch with a longer MAX_LEN: the fp8 KV pool held
     # 196,229-197,744 tokens with the vision tower on (vLLM logs, 2026-09-03 and
     # 09-27); 190,464 (93 x 2048) keeps ~3 % below the smallest pool seen, since
     # vLLM refuses to start when one request at MAX_LEN does not fit the pool
-    "vllm-190k": {"context": 190464, "backend": "vllm", "label": "vLLM 190K",
+    "vllm-190k": {"context": 190464, "backends": ("vllm",), "label": "vLLM 190K",
                   "vllm": {"CTX": "long", "MAX_LEN": "190464"},
                   "note": "vLLM only: 190K window, fp8 KV cache, standard-profile speed"},
 }
@@ -4299,19 +4302,38 @@ def context_profile_from(saved):
     return profile
 
 
+def profile_backends(profile, env=None):
+    """The configured engines that serve `profile`, or None when every engine
+    does (`standard`, or no profile)."""
+    allowed = CONTEXT_PROFILES.get(profile, {}).get("backends")
+    if allowed is None:
+        return None
+    configured = available_backends(env)
+    return [b for b in allowed if b in configured]
+
+
 def available_context_profiles(env=None):
-    backends = available_backends(env)
     return {name: info for name, info in CONTEXT_PROFILES.items()
-            if info["backend"] is None or info["backend"] in backends}
+            if info["backends"] is None or profile_backends(name, env)}
 
 
-def vllm_variants(env=None):
-    """COLI_VLLM_VARIANTS: the 27B model directories the vLLM backend can start,
-    `id=path|label[|max=N]` entries separated by `;` (the first is the default).
-    The persisted `vllm_variant` setting picks one for the next restart; the
-    launcher receives it as MODEL.  `max` caps the window for a model whose KV
-    pool is smaller than a profile asks for (vLLM refuses to start otherwise)."""
-    raw = (os.environ if env is None else env).get("COLI_VLLM_VARIANTS", "")
+# Model catalogues per engine (dashboard "Model" dropdown): `id=path|label[|max=N]`
+# entries separated by `;`, the first is the default.  vLLM: a model directory
+# the launcher receives as MODEL; Strata: a setup-written strata-<model>.json.
+# The persisted `<engine>_variant` setting picks one for the next restart.
+VARIANT_ENVS = {"vllm": "COLI_VLLM_VARIANTS", "strata": "COLI_STRATA_VARIANTS"}
+
+
+def variant_installed(backend, path):
+    return os.path.isfile(path) if backend == "strata" else os.path.isdir(path)
+
+
+def model_variants(backend, env=None):
+    """The catalogue of `backend` (see VARIANT_ENVS).  `max` caps the window for a
+    model whose KV pool is smaller than a profile asks for (vLLM refuses to
+    start otherwise)."""
+    name = VARIANT_ENVS.get(backend)
+    raw = (os.environ if env is None else env).get(name, "") if name else ""
     out = {}
     for item in raw.split(";"):
         variant, _, rest = item.strip().partition("=")
@@ -4329,16 +4351,24 @@ def vllm_variants(env=None):
     return out
 
 
-def saved_vllm_variant(settings_file):
-    """The persisted `vllm_variant` choice, or None."""
+def vllm_variants(env=None):
+    return model_variants("vllm", env)
+
+
+def saved_variant(settings_file, backend):
+    """The persisted `<backend>_variant` choice, or None."""
     if not settings_file:
         return None
     try:
         saved = json.loads(Path(settings_file).expanduser().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    variant = saved.get("vllm_variant") if isinstance(saved, dict) else None
-    return variant if variant in vllm_variants() else None
+    variant = saved.get(f"{backend}_variant") if isinstance(saved, dict) else None
+    return variant if variant in model_variants(backend) else None
+
+
+def saved_vllm_variant(settings_file):
+    return saved_variant(settings_file, "vllm")
 
 
 def saved_context_profile(settings_file):
@@ -4384,16 +4414,19 @@ def resolve_backend(requested=None, settings_file=None, env=None):
     COLI_BACKEND, else the AI-DER engine.  An unconfigured choice falls back
     to it with a warning (a configuration error, not an automatic selection)."""
     env = os.environ if env is None else env
-    # a profile only one backend serves (fast: vLLM, long: llama.cpp) locks
-    # the backend while it is selected
-    locked = CONTEXT_PROFILES.get(saved_context_profile(settings_file), {}).get("backend")
-    choice = canonical_backend(requested or locked or saved_backend(settings_file)
+    choice = canonical_backend(requested or saved_backend(settings_file)
                                or env.get("COLI_BACKEND") or "aider")
+    # a profile only some engines serve (fast: vLLM, long: llama.cpp or Strata)
+    # holds the backend inside that set while it is selected
+    allowed = profile_backends(saved_context_profile(settings_file), env)
+    if not requested and allowed and choice not in allowed:
+        choice = allowed[0]
     if choice not in BACKEND_IDS:
         raise ValueError(f"unknown backend {choice!r} (one of {', '.join(BACKEND_IDS)})")
     if not backend_configured(choice, env):
         print(f"WARNING: backend {choice} is not configured "
-              f"(COLI_LLAMACPP_MODEL / COLI_VLLM_CMD); serving with the AI-DER engine", file=sys.stderr)
+              f"(COLI_LLAMACPP_MODEL / COLI_VLLM_CMD / COLI_STRATA_CMD); serving with the AI-DER engine",
+              file=sys.stderr)
         return "aider"
     return choice
 
@@ -4463,9 +4496,10 @@ def _host_hwinfo():
 
 
 class ProxyEngine(Engine):
-    """An external inference server (llama.cpp's llama-server, or vLLM) spawned
-    and owned by the gateway, driven through its OpenAI `/v1/completions`
-    endpoint with the gateway's own rendered prompt.  Same `generate()`
+    """An external inference server (llama.cpp's llama-server, vLLM or Strata)
+    spawned and owned by the gateway, driven through its OpenAI `/v1/completions`
+    endpoint with the gateway's own rendered prompt (Strata, which has none:
+    its chat endpoint, the reply re-serialized into the native text).  Same `generate()`
     contract as `Engine`; the proxy holds the scheduler admission exactly like
     the native engine does.  One backend process at a time owns the GPU.
 
@@ -4524,7 +4558,7 @@ class ProxyEngine(Engine):
             self.max_images = int(environ.get("COLI_LLAMACPP_IMAGES", "8"))
             environ.setdefault("LLAMA_MEDIA_MARKER", MTMD_MARKER)
             self.media_marker = environ["LLAMA_MEDIA_MARKER"]
-        else:
+        elif backend == "vllm":
             cmd = shlex.split(environ.get("COLI_VLLM_CMD", ""))
             model = environ.get("COLI_VLLM_MODEL", cmd[2] if len(cmd) > 2 else "")
             port = int(environ.get("COLI_VLLM_PORT", "8082"))
@@ -4577,6 +4611,52 @@ class ProxyEngine(Engine):
             self.images = environ.get("VISION") == "1"
             self.max_images = int(environ.get("COLI_VLLM_IMAGES", "1"))
             self.media_marker = "[image]"
+        else:
+            # Strata (github.com/Niko1221/Strata), an engine for this model: its
+            # Python server in front of the engine, started from a setup-written
+            # strata-<model>.json (COLI_STRATA_VARIANTS).  It has no raw-prompt
+            # endpoint, so every turn takes the chat path vLLM image turns take
+            # (prepare_images), with the thinking switch, effort and budget.
+            cmd = shlex.split(environ.get("COLI_STRATA_CMD", ""))
+            port = int(environ.get("COLI_STRATA_PORT", "8084"))
+            variants = model_variants("strata", environ)
+            self.variant = environ.get("COLI_STRATA_VARIANT")
+            if self.variant not in variants:
+                self.variant = next(iter(variants), None)
+            if self.variant is None:
+                raise ValueError("COLI_STRATA_VARIANTS names no model")
+            source = variants[self.variant]["path"]
+            config = json.loads(Path(source).read_text(encoding="utf-8"))
+            # the window: standard 131K or long 262K (the profiles Strata serves),
+            # capped by the model's `max`; the engine refuses a prompt plus
+            # max_tokens past it unless fit_max_tokens shortens max_tokens
+            self.context_profile = environ.get("COLI_CONTEXT_PROFILE") or "standard"
+            if (self.context_profile not in CONTEXT_PROFILES or
+                    "strata" not in (CONTEXT_PROFILES[self.context_profile]["backends"] or ("strata",))):
+                self.context_profile = "standard"
+            self.context_window = CONTEXT_PROFILES[self.context_profile]["context"]
+            cap = variants[self.variant]["max_context"]
+            if cap and self.context_window > cap:
+                self.context_window = cap
+            config["args"] = _with_flag(list(config.get("args", [])), ("--max-context",),
+                                        str(self.context_window))
+            config["args_written"] = list(config["args"])     # the args setup wrote, to Strata
+            config["port"] = port
+            config["host"] = "127.0.0.1"
+            config["fit_max_tokens"] = True
+            config["open_browser"] = False
+            runtime = Path(environ.get("COLI_STRATA_RUNTIME")
+                           or Path.home() / ".cache" / "ai-der" / "strata")
+            runtime.mkdir(parents=True, exist_ok=True)
+            derived = runtime / f"strata-{self.variant}-{self.context_window}.json"
+            derived.write_text(json.dumps(config, indent=1), encoding="utf-8")
+            cmd = [*cmd, "--config", str(derived), "--port", str(port)]
+            self.cwd = config.get("cwd") or environ.get("COLI_STRATA_DIR") or None
+            model = str(config.get("model_name") or self.variant)
+            self.upstream_model = model
+            self.images = "--vision" in config["args"] and bool(config.get("vision"))
+            self.max_images = int(environ.get("COLI_STRATA_IMAGES", "4"))
+            self.media_marker = "[image]"
         self.command = cmd
         self.child_env = environ
         self.arch = arch
@@ -4628,7 +4708,7 @@ class ProxyEngine(Engine):
 
     # prefill-rate floors for the stall deadline (tok/s; measured cold: vLLM
     # 680 at 188K and 1,450 at 3K, llama.cpp 176 at 261K)
-    STALL_PREFILL_RATE = {"vllm": 300, "llamacpp": 100}
+    STALL_PREFILL_RATE = {"vllm": 300, "llamacpp": 100, "strata": 400}
 
     # -- lifecycle -----------------------------------------------------------
     def _start_process(self):
@@ -4637,7 +4717,7 @@ class ProxyEngine(Engine):
         # the next backend starts)
         self.process = subprocess.Popen(self.command, env=self.child_env, stdin=subprocess.DEVNULL,
                                         stdout=sys.stderr, stderr=subprocess.STDOUT,
-                                        start_new_session=True)
+                                        start_new_session=True, cwd=getattr(self, "cwd", None))
         self._wait_ready(self.start_timeout)
         if self.backend_id == "vllm":
             self.warm_prefixes()
@@ -4721,7 +4801,9 @@ class ProxyEngine(Engine):
                 conn = http.client.HTTPConnection(self.host, self.port, timeout=2.0)
                 try:
                     conn.request("GET", "/health")
-                    if conn.getresponse().status == 200:
+                    response = conn.getresponse()
+                    body = response.read()
+                    if response.status == 200 and self._health_ready(body):
                         return
                 finally:
                     conn.close()
@@ -4730,6 +4812,16 @@ class ProxyEngine(Engine):
             if time.monotonic() > deadline:
                 raise RuntimeError(f"{self.backend['label']} did not become ready in {timeout:.0f} s")
             time.sleep(1.0)
+
+    def _health_ready(self, body):
+        """Strata answers /health at once and reports max_context 0 until its
+        engine is loaded; the other upstreams answer 200 only when ready."""
+        if self.backend_id != "strata":
+            return True
+        try:
+            return int(json.loads(body or b"{}").get("max_context") or 0) > 0
+        except (ValueError, AttributeError):
+            return False
 
     def is_alive(self):
         if self.closed:
@@ -4856,6 +4948,8 @@ class ProxyEngine(Engine):
         request whose slot does not hold that prefix restores the file before
         prefilling, so a repeated startup prefix survives restarts.  Returns
         the restored token count (0 when nothing was restored)."""
+        if self.backend_id == "strata":
+            return 0
         cut = stable_prefix_cut(prompt, self.arch)
         if cut < self.prefix_min_chars:
             return 0
@@ -4949,7 +5043,7 @@ class ProxyEngine(Engine):
                            "messages", "unsupported_content_type")
         media = chat = None
         if image is not None:
-            if not isinstance(image, ProxyImages) or not self.images:
+            if not isinstance(image, ProxyImages) or (image.media and not self.images):
                 raise APIError(400, f"The {self.backend['label']} backend was started without "
                                     "its vision tower; images need the AI-DER backend.",
                                "messages", "unsupported_content_type")
@@ -5012,6 +5106,8 @@ class ProxyEngine(Engine):
         budget = int(reasoning_budget or 0)
         # (the chat path has no raw prompt to continue from: no budget on vLLM image turns)
         think_open = budget > 0 and prompt.rstrip().endswith("<think>") and chat is None
+        if chat is not None and budget > 0 and self.backend_id == "strata":
+            chat = dict(chat, reasoning_budget=budget)      # Strata closes the thinking itself
         state = {"in_think": think_open, "reason_tokens": 0, "tail": "", "cut": False,
                  "text": [], "total": 0, "exact": False}
 
@@ -5228,6 +5324,11 @@ class ProxyEngine(Engine):
                 "top_k": SAMPLING_DEFAULTS[thinking]["top_k"]}
         if getattr(self, "_presence", None):
             body["presence_penalty"] = float(self._presence)
+        if self.backend_id == "strata":
+            if thinking and chat.get("reasoning_effort"):
+                body["chat_template_kwargs"]["reasoning_effort"] = chat["reasoning_effort"]
+            if chat.get("reasoning_budget"):
+                body["reasoning_budget_tokens"] = int(chat["reasoning_budget"])
         if chat.get("tools"):
             body["tools"] = chat["tools"]
             if chat.get("tool_choice") in ("auto", "none", "required"):
@@ -5404,10 +5505,20 @@ class ProxyEngine(Engine):
                 "finish_reason": finish_reason, "cancel": cancel, "stop": stop,
                 "seconds": seconds, "first_token_at": first_token_at}
 
-    def prepare_images(self, messages, tools, tool_choice, enable_thinking):
+    def prepare_images(self, messages, tools, tool_choice, enable_thinking, reasoning_effort=None):
         """P6.5: the request's image parts for this proxy.  Returns (messages
-        for the gateway's renderer, ProxyImages or None)."""
+        for the gateway's renderer, ProxyImages or None).  On Strata every turn
+        carries the chat request (it has no raw-prompt endpoint)."""
         placeholder = self.media_marker
+        if self.backend_id == "strata":
+            rewritten, media = collect_proxy_images(messages, placeholder)
+            if media and not self.images:
+                raise APIError(400, "The Strata backend was started without its vision encoder.",
+                               "messages", "unsupported_content_type")
+            chat = {"messages": proxy_chat_messages(messages, self.max_images), "tools": tools,
+                    "tool_choice": tool_choice, "enable_thinking": enable_thinking,
+                    "reasoning_effort": reasoning_effort if enable_thinking else None}
+            return rewritten, ProxyImages(media, chat)
         if self.backend_id == "llamacpp":
             messages = limit_image_parts(messages, self.max_images)
         rewritten, media = collect_proxy_images(messages, placeholder)
@@ -5552,7 +5663,7 @@ class APIServer(ThreadingHTTPServer):
         self.backend_id = "aider"            # the running backend (serve() sets it)
         self.backend_next = None             # persisted choice, applied by the next restart
         self.context_profile = None          # persisted context profile, applied by the next restart
-        self.vllm_variant = None             # persisted 27B model variant, applied by the next restart
+        self.variants = {}                   # persisted model per engine (VARIANT_ENVS), applied by the next restart
         self.backend_error = None            # why the chosen backend is not the running one
         self._load_settings()
         self._conn_lock = threading.Lock()
@@ -5576,8 +5687,8 @@ class APIServer(ThreadingHTTPServer):
             self.backend_next = backend if backend in BACKEND_IDS else None
             profile = context_profile_from(saved)
             self.context_profile = profile if profile in CONTEXT_PROFILES else None
-            variant = saved.get("vllm_variant")
-            self.vllm_variant = variant if variant in vllm_variants() else None
+            self.variants = {b: saved.get(f"{b}_variant") for b in VARIANT_ENVS
+                             if saved.get(f"{b}_variant") in model_variants(b)}
             if isinstance(saved.get("api_defaults"), dict):
                 try:
                     self.api_defaults = {k: v for k, v in validate_api_defaults(saved["api_defaults"]).items()
@@ -5600,15 +5711,27 @@ class APIServer(ThreadingHTTPServer):
                 "backend_next": self.backend_next or self.backend_id,
                 "backends": available_backends(),
                 "context_profile": self.context_profile or DEFAULT_CONTEXT_PROFILE,
-                "backend_locked": CONTEXT_PROFILES.get(self.context_profile, {}).get("backend"),
+                # the engines the selected profile allows (None: every engine); the
+                # dashboard offers only these, and a single one is selected for you
+                "backends_allowed": profile_backends(self.context_profile),
+                "backend_locked": (lambda a: a[0] if a and len(a) == 1 else None)(
+                    profile_backends(self.context_profile)),
                 "context_profile_active": (getattr(self.engine, "backend", None) or {}).get("profile")
                                           if self.engine is not None else None,
-                "context_profiles": {k: {"context": v["context"], "note": v["note"], "backend": v["backend"],
+                "context_profiles": {k: {"context": v["context"], "note": v["note"],
+                                         "backends": profile_backends(k),
                                          "label": v.get("label") or k}
                                      for k, v in available_context_profiles().items()},
-                "vllm_variant": self.vllm_variant or next(iter(vllm_variants()), None),
-                "vllm_variant_active": (getattr(self.engine, "backend", None) or {}).get("variant")
-                                       if self.engine is not None else None,
+                # model per engine: the persisted choice, the running one, the catalogue
+                "variants": {b: {"selected": self.variants.get(b) or next(iter(model_variants(b)), None),
+                                 "active": self._active_variant(b),
+                                 "options": {k: {"label": v["label"],
+                                                 "available": variant_installed(b, v["path"]),
+                                                 "max_context": v["max_context"]}
+                                             for k, v in model_variants(b).items()}}
+                             for b in VARIANT_ENVS if model_variants(b)},
+                "vllm_variant": self.variants.get("vllm") or next(iter(vllm_variants()), None),
+                "vllm_variant_active": self._active_variant("vllm"),
                 "vllm_variants": {k: {"label": v["label"], "available": os.path.isdir(v["path"]),
                                       "max_context": v["max_context"]}
                                   for k, v in vllm_variants().items()},
@@ -5616,11 +5739,16 @@ class APIServer(ThreadingHTTPServer):
                 **({"backend_error": self.backend_error} if self.backend_error else {}),
             }
 
+    def _active_variant(self, backend):
+        running = (getattr(self.engine, "backend", None) or {}) if self.engine is not None else {}
+        return running.get("variant") if running.get("id") == backend else None
+
     def update_settings(self, body):
         if not body:
             raise APIError(400, "At least one server setting is required.")
         unknown = set(body) - {"system_prompt", "prepend_system_prompt", "backend", "api_defaults",
-                               "context_profile", "vllm_profile", "vllm_variant"}
+                               "context_profile", "vllm_profile",
+                               *(f"{b}_variant" for b in VARIANT_ENVS)}
         if unknown:
             raise APIError(400, f"Unsupported setting: {sorted(unknown)[0]}",
                            sorted(unknown)[0], "unsupported_parameter")
@@ -5647,29 +5775,33 @@ class APIServer(ThreadingHTTPServer):
                 if context_profile not in CONTEXT_PROFILES:
                     raise APIError(400, f"`context_profile` must be one of {', '.join(CONTEXT_PROFILES)}; "
                                         "it applies at the next restart.", named, "invalid_value")
-            locked = CONTEXT_PROFILES.get(context_profile, {}).get("backend")
-            if locked:
-                # a profile only one backend serves moves the next backend there
-                # and holds it until `standard` is selected again
-                if locked not in available_backends():
-                    raise APIError(400, f"`context_profile` {context_profile} needs the "
-                                        f"{BACKEND_LABELS[locked]} backend configured.",
-                                   "context_profile", "invalid_value")
-                if "backend" in body and backend != locked:
-                    raise APIError(400, f"`backend` is locked to {locked} while the {context_profile} "
-                                        "context profile is selected; choose the standard profile first.",
-                                   "backend", "invalid_value")
-                backend = locked
-            vllm_variant = self.vllm_variant
-            if "vllm_variant" in body:
-                vllm_variant = body["vllm_variant"]
-                variants = vllm_variants()
-                if vllm_variant not in variants:
-                    raise APIError(400, f"`vllm_variant` must be one of {', '.join(variants) or '(none configured)'}; "
-                                        "it applies at the next restart.", "vllm_variant", "invalid_value")
-                if not os.path.isdir(variants[vllm_variant]["path"]):
-                    raise APIError(400, f"The {vllm_variant} model directory is not installed.",
-                                   "vllm_variant", "invalid_value")
+            allowed = profile_backends(context_profile)
+            if allowed is not None:
+                # a profile only some engines serve holds the next backend inside
+                # that set: an explicit choice outside it is refused, otherwise the
+                # backend moves to the first engine that serves the profile
+                if not allowed:
+                    names = ", ".join(BACKEND_LABELS[b] for b in CONTEXT_PROFILES[context_profile]["backends"])
+                    raise APIError(400, f"`context_profile` {context_profile} needs one of these backends "
+                                        f"configured: {names}.", "context_profile", "invalid_value")
+                if backend not in allowed:
+                    if "backend" in body:
+                        raise APIError(400, f"`backend` must be one of {', '.join(allowed)} while the "
+                                            f"{context_profile} context profile is selected.",
+                                       "backend", "invalid_value")
+                    backend = allowed[0]
+            variants = dict(self.variants)
+            for engine_id in VARIANT_ENVS:
+                key = f"{engine_id}_variant"
+                if key not in body:
+                    continue
+                choice, catalogue = body[key], model_variants(engine_id)
+                if choice not in catalogue:
+                    raise APIError(400, f"`{key}` must be one of {', '.join(catalogue) or '(none configured)'}; "
+                                        "it applies at the next restart.", key, "invalid_value")
+                if not variant_installed(engine_id, catalogue[choice]["path"]):
+                    raise APIError(400, f"The {choice} model is not installed.", key, "invalid_value")
+                variants[engine_id] = choice
             api_defaults = dict(self.api_defaults)
             if "api_defaults" in body:
                 for key, value in validate_api_defaults(body["api_defaults"]).items():
@@ -5687,7 +5819,7 @@ class APIServer(ThreadingHTTPServer):
                         "backend": backend,
                         "api_defaults": api_defaults,
                         **({"context_profile": context_profile} if context_profile else {}),
-                        **({"vllm_variant": vllm_variant} if vllm_variant else {}),
+                        **{f"{b}_variant": v for b, v in variants.items() if v},
                     }, ensure_ascii=False), encoding="utf-8")
                     temporary.chmod(0o600)
                     os.replace(temporary, self.settings_file)
@@ -5699,7 +5831,7 @@ class APIServer(ThreadingHTTPServer):
             self.prepend_system_prompt = enabled
             self.backend_next = backend
             self.context_profile = context_profile
-            self.vllm_variant = vllm_variant
+            self.variants = variants
             self.api_defaults = api_defaults
         return self.settings_payload()
 
@@ -6793,7 +6925,7 @@ class APIHandler(BaseHTTPRequestHandler):
             # P6.5: raw images for the proxy (llama.cpp takes them on the
             # completions endpoint, vLLM on its chat endpoint)
             messages, image = self.server.engine.prepare_images(
-                messages, tools, tool_choice, enable_thinking)
+                messages, tools, tool_choice, enable_thinking, reasoning_effort)
         elif ARCH == "glm53":
             messages, images = expand_glm53_images(
                 messages, getattr(self.server.engine, "model_dir", None))
@@ -6938,7 +7070,8 @@ class APIHandler(BaseHTTPRequestHandler):
         image = None
         if isinstance(self.server.engine, ProxyEngine):
             messages, image = self.server.engine.prepare_images(
-                messages, tools, tool_choice, enable_thinking)
+                messages, tools, tool_choice, enable_thinking,
+                defaults.get("reasoning_effort", "xhigh") if enable_thinking else None)
         elif ARCH == "qwen38":
             messages, images = expand_qwen38_images(limit_image_parts(messages, QWEN38_MAX_IMAGES))
             if len(images) > QWEN38_MAX_IMAGES:
@@ -7299,7 +7432,7 @@ class APIHandler(BaseHTTPRequestHandler):
         image = None
         if isinstance(self.server.engine, ProxyEngine):
             messages, image = self.server.engine.prepare_images(
-                messages, tools, tool_choice, enable_thinking)
+                messages, tools, tool_choice, enable_thinking, effort)
         elif ARCH == "qwen38":
             messages, images = expand_qwen38_images(limit_image_parts(messages, QWEN38_MAX_IMAGES))
             if len(images) > QWEN38_MAX_IMAGES:
@@ -7705,9 +7838,9 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
                 if profile:
                     proxy_env["COLI_CONTEXT_PROFILE"] = profile
                     proxy_env.pop("COLI_VLLM_PROFILE", None)
-                variant = saved_vllm_variant(os.environ.get("COLI_SETTINGS_FILE"))
+                variant = saved_variant(os.environ.get("COLI_SETTINGS_FILE"), backend)
                 if variant:
-                    proxy_env["COLI_VLLM_VARIANT"] = variant
+                    proxy_env[f"COLI_{backend.upper()}_VARIANT"] = variant
                 runtime = ProxyEngine(backend, model_id, max_tokens, proxy_env, kv_slots, family)
             except Exception as error:
                 # a backend that cannot start must not take the service down

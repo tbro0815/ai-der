@@ -36,7 +36,7 @@ import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { pickSuggestions } from "@/prompts"
 import { WEB_SEARCH_TOOLS, parseWebSearchResult } from "@/tools"
-import { type PrefillProgress, getHealth, getServerSettings, listModels, resetCache, restartServer, streamChat, updateApiDefaults, updateServerBackend, updateContextProfile, updateVllmVariant, webSearch as webSearchCall, updateServerSettings, withSystemPrompt, type ChatMessage, type HealthResponse, type ServerSettings, type StreamChatResult } from "@/lib/api"
+import { type PrefillProgress, getHealth, getServerSettings, listModels, resetCache, restartServer, streamChat, updateApiDefaults, updateServerBackend, updateContextProfile, updateVariant, webSearch as webSearchCall, updateServerSettings, withSystemPrompt, type ChatMessage, type HealthResponse, type ServerSettings, type StreamChatResult } from "@/lib/api"
 import { activeRequests, decodeTokensPerSecond, supportsCacheSlots } from "@/lib/runtime"
 import { Brain } from "./Brain"
 import { Profiling } from "./Profiling"
@@ -222,7 +222,7 @@ export default function App() {
   const [connecting, setConnecting] = useState(false)
   const [restarting, setRestarting] = useState(false)
   const [switchingBackend, setSwitchingBackend] = useState(false)
-  const backendLabel = (id: string) => ({ aider: "AI-DER", llamacpp: "llama.cpp", vllm: "vLLM" } as Record<string, string>)[id] || id
+  const backendLabel = (id: string) => ({ aider: "AI-DER", llamacpp: "llama.cpp", vllm: "vLLM", strata: "Strata" } as Record<string, string>)[id] || id
   const chooseBackend = async (backend: string) => {
     if (!serverSettings || backend === serverSettings.backend_next) return
     setSwitchingBackend(true)
@@ -234,11 +234,11 @@ export default function App() {
       setSwitchingBackend(false)
     }
   }
-  const chooseVllmVariant = async (variant: string) => {
-    if (!serverSettings || variant === serverSettings.vllm_variant) return
+  const chooseVariant = async (engine: string, variant: string) => {
+    if (!serverSettings || variant === serverSettings.variants?.[engine]?.selected) return
     setSwitchingBackend(true)
     try {
-      setServerSettings(await updateVllmVariant(baseUrl, apiKey, variant))
+      setServerSettings(await updateVariant(baseUrl, apiKey, engine, variant))
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause))
     } finally {
@@ -769,31 +769,41 @@ export default function App() {
             <div><dt>backend</dt><dd>{backendLabel(health?.backend ? health.backend.id : serverSettings?.backend || "—")}</dd></div>
           </dl>
           <span className="field-help">{t("sidebar.extraDefaultsHelp")}</span>
-          {serverSettings?.backends && serverSettings.backends.length > 1 ? (
-            <label className="backend-choice">{t("sidebar.backend")}
-              <select value={serverSettings.backend_next || serverSettings.backend} disabled={switchingBackend} onChange={(event) => void chooseBackend(event.target.value)}>
-                {serverSettings.backends.map((id) => <option key={id} value={id} disabled={!!serverSettings.backend_locked && id !== serverSettings.backend_locked}>{backendLabel(id)}{serverSettings.backend_locked && id !== serverSettings.backend_locked ? ` (${t("sidebar.backendUnavailable", { profile: serverSettings.context_profile || "" })})` : ""}</option>)}
-              </select>
-              <span className="field-help">{serverSettings.backend_error ? `${t("sidebar.backendFailed")} ${serverSettings.backend_error}` : serverSettings.backend_locked ? t("sidebar.backendLocked", { backend: backendLabel(serverSettings.backend_locked), profile: serverSettings.context_profile || "" }) : serverSettings.backend_next && serverSettings.backend_next !== serverSettings.backend ? t("sidebar.backendPending") : t("sidebar.backendHelp")}</span>
-              {serverSettings.backend_locked ? <Button type="button" variant="secondary" size="sm" disabled={switchingBackend} onClick={() => void chooseContextProfile("standard")}>{t("sidebar.unlockStandard")}</Button> : null}
-            </label>
-          ) : null}
           {serverSettings?.context_profiles && Object.keys(serverSettings.context_profiles).length > 1 ? (
             <label className="backend-choice">{t("sidebar.contextProfile")}
               <select value={serverSettings.context_profile || "standard"} disabled={switchingBackend} onChange={(event) => void chooseContextProfile(event.target.value)}>
-                {Object.entries(serverSettings.context_profiles).map(([id, info]) => <option key={id} value={id}>{info.label && info.label !== id ? info.label : `${id} · ${Math.round(info.context / 1024)}K${info.backend ? ` · ${backendLabel(info.backend)}` : ""}`}</option>)}
+                {Object.entries(serverSettings.context_profiles).map(([id, info]) => <option key={id} value={id}>{info.label && info.label !== id ? info.label : id} · {Math.round(info.context / 1024)}K · {info.backends ? info.backends.map(backendLabel).join(", ") : t("sidebar.everyEngine")}</option>)}
               </select>
               <span className="field-help">{serverSettings.context_profile_active && serverSettings.context_profile_active !== (serverSettings.context_profile || "standard") ? t("sidebar.contextProfilePending") : t("sidebar.contextProfileHelp")}</span>
             </label>
           ) : null}
-          {serverSettings?.vllm_variants && Object.keys(serverSettings.vllm_variants).length > 1 ? (
-            <label className="backend-choice">{t("sidebar.vllmVariant")}
-              <select value={serverSettings.vllm_variant || ""} disabled={switchingBackend} onChange={(event) => void chooseVllmVariant(event.target.value)}>
-                {Object.entries(serverSettings.vllm_variants).map(([id, info]) => <option key={id} value={id} disabled={!info.available}>{info.label}{info.max_context ? ` · ${t("sidebar.vllmVariantMax", { k: Math.round(info.max_context / 1024) })}` : ""}{info.available ? "" : ` (${t("sidebar.vllmVariantMissing")})`}</option>)}
-              </select>
-              <span className="field-help">{serverSettings.vllm_variant_active && serverSettings.vllm_variant_active !== serverSettings.vllm_variant ? t("sidebar.vllmVariantPending") : t("sidebar.vllmVariantHelp")}</span>
-            </label>
-          ) : null}
+          {serverSettings?.backends && serverSettings.backends.length > 1 ? (() => {
+            // the engines the selected profile allows; one alone is selected for you
+            const engines = serverSettings.backends_allowed ?? serverSettings.backends
+            const next = serverSettings.backend_next || serverSettings.backend
+            return (
+              <label className="backend-choice">{t("sidebar.backend")}
+                <select value={next} disabled={switchingBackend || engines.length < 2} onChange={(event) => void chooseBackend(event.target.value)}>
+                  {engines.map((id) => <option key={id} value={id}>{backendLabel(id)}</option>)}
+                </select>
+                <span className="field-help">{serverSettings.backend_error ? `${t("sidebar.backendFailed")} ${serverSettings.backend_error}` : engines.length < 2 ? t("sidebar.backendByProfile", { profile: serverSettings.context_profile || "" }) : serverSettings.backend_next && serverSettings.backend_next !== serverSettings.backend ? t("sidebar.backendPending") : t("sidebar.backendHelp")}</span>
+              </label>
+            )
+          })() : null}
+          {(() => {
+            // the model list of the engine that starts next
+            const engine = serverSettings?.backend_next || serverSettings?.backend || ""
+            const catalogue = serverSettings?.variants?.[engine]
+            if (!catalogue || Object.keys(catalogue.options).length < 2) return null
+            return (
+              <label className="backend-choice">{t("sidebar.model", { engine: backendLabel(engine) })}
+                <select value={catalogue.selected || ""} disabled={switchingBackend} onChange={(event) => void chooseVariant(engine, event.target.value)}>
+                  {Object.entries(catalogue.options).map(([id, info]) => <option key={id} value={id} disabled={!info.available}>{info.label}{info.max_context ? ` · ${t("sidebar.modelMax", { k: Math.round(info.max_context / 1024) })}` : ""}{info.available ? "" : ` (${t("sidebar.modelMissing")})`}</option>)}
+                </select>
+                <span className="field-help">{catalogue.active && catalogue.active !== catalogue.selected ? t("sidebar.modelPending") : t("sidebar.modelHelp", { engine: backendLabel(engine) })}</span>
+              </label>
+            )
+          })()}
           {restartSupported ? (
             <div className="restart-action">
               <Button type="button" variant="destructive" size="sm" onClick={() => void restart()} disabled={restarting || loading}>
