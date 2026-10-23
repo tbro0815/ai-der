@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # AI-DER: install in this checkout on an Ubuntu/CUDA workstation.
 # Default: engine + dashboard, the model weights (downloaded and converted, MTP draft
-# prepared), the llama.cpp, vLLM and Strata backends, and ai-der.env for serving.
+# prepared), the llama.cpp, vLLM and Strata backends, and ai-der.env for serving; the Maya
+# backend (GLM-5.3-Flash, DeepSeek-V4.1-Flash) on request (--with-maya).
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 fail() { echo "AI-DER: $*" >&2; exit 1; }
 usage() {
     cat <<'EOF'
 Usage: ./install.sh [--check] [--no-apt] [--core-only] [--skip-models] [--skip-llamacpp]
-                    [--skip-vllm] [--skip-strata] [--systemd] [--data-dir DIR]
+                    [--skip-vllm] [--skip-strata] [--with-maya] [--systemd] [--data-dir DIR]
   --check          preflight only (OS, RAM, GPU, CUDA toolkit, disk)
   --no-apt         host already provisioned: skip the sudo apt step
   --core-only      engine + dashboard only, no weights and no extra backends
@@ -17,12 +18,15 @@ Usage: ./install.sh [--check] [--no-apt] [--core-only] [--skip-models] [--skip-l
   --skip-vllm      do not install the vLLM (Qwen3.8-27B) backend
   --skip-strata    do not install the Strata backend and its models (~180 GB of downloads;
                    AI_DER_STRATA_MODELS=gsq,uncensored,ud picks a subset)
+  --with-maya      also install the Maya backend and its models (GLM-5.3-Flash Maya-S24 96 GB,
+                   Maya-M-Derisked 117 GB, DeepSeek-V4.1-Flash Maya-S 348 GB;
+                   AI_DER_MAYA_MODELS=glm-s24,glm-m-derisked,ds4-s picks a subset)
   --systemd        also write a user unit (~/.config/systemd/user/ai-der.service)
   --data-dir DIR   weights, container and backends go here (default ~/ai-der-data, ~410 GB)
 Targets Ubuntu 24.04/26.04 x86_64, CUDA 12.4+, RTX 3090/3090 Ti, 128 GB RAM.
 EOF
 }
-mode=install; apt=1; models=1; llamacpp=1; vllm=1; strata=1; systemd=0
+mode=install; apt=1; models=1; llamacpp=1; vllm=1; strata=1; maya=0; systemd=0
 data=${AI_DER_DATA:-$HOME/ai-der-data}
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -34,6 +38,7 @@ while [[ $# -gt 0 ]]; do
         --skip-llamacpp) llamacpp=0 ;;
         --skip-vllm) vllm=0 ;;
         --skip-strata) strata=0 ;;
+        --with-maya) maya=1 ;;
         --systemd) systemd=1 ;;
         --data-dir) [[ $# -ge 2 ]] || fail '--data-dir needs a directory.'; data=$2; shift ;;
         *) fail "Unknown argument: $1" ;;
@@ -63,8 +68,16 @@ cuda_version=$("$CUDA_HOME/bin/nvcc" --version | sed -n 's/.*release \([0-9]*\.[
 [[ $(printf '%s\n' 12.4 "$cuda_version" | sort -V | head -n 1) == 12.4 ]] || fail 'CUDA Toolkit 12.4+ is required.'
 echo "GPU: $gpus; CUDA: $cuda_version"
 # disk: weights and container ~170 GB, vLLM stack ~40 GB, llama.cpp ~3 GB, the CUDA 13
-# toolkit ~4 GB, Strata with its models ~180 GB (GSQ-RCO IQ3_S 84, uncensored i1-IQ3_S 89, MTP 7)
-need_gb=$(( models * 170 + vllm * 40 + llamacpp * 3 + strata * 180 + (llamacpp | strata) * 4 + 5 ))
+# toolkit ~4 GB, Strata with its models ~180 GB (GSQ-RCO IQ3_S 84, uncensored i1-IQ3_S 89, MTP 7),
+# Maya per model (with its vision files and pack)
+maya_gb=0
+if (( maya )); then
+    want=${AI_DER_MAYA_MODELS:-glm-s24,glm-m-derisked,ds4-s}
+    [[ ,$want, == *,glm-s24,* ]] && maya_gb=$(( maya_gb + 96 ))
+    [[ ,$want, == *,glm-m-derisked,* ]] && maya_gb=$(( maya_gb + 117 ))
+    [[ ,$want, == *,ds4-s,* ]] && maya_gb=$(( maya_gb + 350 ))
+fi
+need_gb=$(( models * 170 + vllm * 40 + llamacpp * 3 + strata * 180 + (llamacpp | strata | maya) * 4 + maya_gb + 5 ))
 probe=$data; while [[ ! -d $probe ]]; do probe=$(dirname "$probe"); done
 free_gb=$(df -Pk "$probe" | awk 'NR==2 {print int($4 / 1048576)}')
 echo "Data directory: $data ($free_gb GB free, about $need_gb GB needed for the selected components)"
@@ -106,10 +119,11 @@ make -C engine/c -j"$(nproc)" qwen38 CC=gcc-13 CUDA=1 CUDA_ARCH=sm_86 CUDA_HOME=
 
 mkdir -p "$data"
 (( models )) && engine/c/install_models.sh
-(( llamacpp || strata )) && engine/c/install_cuda13.sh
+(( llamacpp || strata || maya )) && engine/c/install_cuda13.sh
 (( llamacpp )) && engine/c/install_llamacpp.sh
 (( vllm )) && engine/c/install_vllm.sh
 (( strata )) && engine/c/install_strata.sh
+(( maya )) && engine/c/install_maya.sh
 if (( systemd )); then engine/c/write_env.sh --systemd; else engine/c/write_env.sh; fi
 cat <<EOF
 

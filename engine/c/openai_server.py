@@ -3617,6 +3617,7 @@ class Engine:
         self.progress = None                 # live prefill position of the in-flight request
         self._progress_logged_at = {}
         self._progress_restored = {}     # request id -> restored prefix tokens (last PROGRESS)
+        self._prefill_cached = {}        # request id -> prompt tokens served from cache (PREFILL)
         self.hwinfo = None
         self.emap = None
         self.hits = None
@@ -3858,6 +3859,7 @@ class Engine:
                             not math.isfinite(elapsed) or elapsed < 0):
                         raise RuntimeError("invalid engine PREFILL values")
                     prefilled_tokens = prompt_tokens - cached_tokens
+                    self._prefill_cached[request_id] = cached_tokens
                     self._record_telemetry(
                         "prefill_finished", request_id,
                         prompt_tokens=prompt_tokens,
@@ -3871,6 +3873,8 @@ class Engine:
                     request_id = fields[1]
                     stats = self._stats(fields[2:])
                     stats["restored_tokens"] = self._progress_restored.pop(request_id, None)
+                    stats["cached_tokens"] = (self._prefill_cached.pop(request_id, None)
+                                              or stats["restored_tokens"] or 0)
                     meta = self._telemetry_request(request_id, remove=True)
                     self._record_telemetry(
                         "generation_finished", request_id,
@@ -4234,9 +4238,16 @@ class Engine:
 # scheduler, telemetry and dashboard are shared; only the token producer
 # differs.  The active backend is visible in /health `backend`, in the
 # telemetry `runtime.backend` field and in /v1/settings.
-BACKEND_IDS = ("aider", "llamacpp", "vllm", "strata")
-BACKEND_LABELS = {"aider": "AI-DER", "llamacpp": "llama.cpp", "vllm": "vLLM", "strata": "Strata"}
+BACKEND_IDS = ("aider", "llamacpp", "vllm", "strata", "maya")
+BACKEND_LABELS = {"aider": "AI-DER", "llamacpp": "llama.cpp", "vllm": "vLLM", "strata": "Strata",
+                  "maya": "Maya"}
 BACKEND_ALIASES = {"colibri": "aider"}        # pre-rename settings files
+# Engines started from a setup-written JSON config and driven through their chat
+# endpoint only (no raw-prompt endpoint): Strata (Qwen3.8-Flash-Next) and its
+# fork Project Maya (GLM-5.3-Flash, DeepSeek-V4.1-Flash).  COLI_<ENGINE>_CMD /
+# _PORT / _DIR / _RUNTIME / _VARIANTS / _IMAGES configure each.
+CHAT_BACKENDS = ("strata", "maya")
+CHAT_BACKEND_PORTS = {"strata": 8084, "maya": 8085}
 
 
 def canonical_backend(backend):
@@ -4251,8 +4262,8 @@ def backend_configured(backend, env=None):
         return bool(env.get("COLI_LLAMACPP_MODEL"))
     if backend == "vllm":
         return bool(env.get("COLI_VLLM_CMD"))
-    if backend == "strata":
-        return bool(env.get("COLI_STRATA_CMD")) and bool(model_variants("strata", env))
+    if backend in CHAT_BACKENDS:
+        return bool(env.get(f"COLI_{backend.upper()}_CMD")) and bool(model_variants(backend, env))
     return False
 
 
@@ -4264,7 +4275,7 @@ def available_backends(env=None):
 # window at the next restart.  `standard` (131K) is the one-context contract every
 # backend serves.  `fast` (80K, vLLM launcher CTX=fast), `vllm-190k` (vLLM's fp8
 # KV pool used to its safe size) and `long` (262K, the model's native length,
-# llama.cpp with a q8_0 KV cache or Strata) each knowingly leave that contract
+# llama.cpp with a q8_0 KV cache, Strata or Maya) each knowingly leave that contract
 # while selected; `backends` names the engines that serve a profile (None: every
 # engine), and the backend for the next start is held inside that set.
 CONTEXT_PROFILES = {
@@ -4276,8 +4287,8 @@ CONTEXT_PROFILES = {
     "standard": {"context": 131072, "backends": None,
                  "vllm": {"CTX": "long", "MAX_LEN": "131072"},
                  "note": "every backend: 131K window"},
-    "long": {"context": 262144, "backends": ("llamacpp", "strata"),
-             "note": "llama.cpp or Strata: 262K window (the model's native length)"},
+    "long": {"context": 262144, "backends": ("llamacpp", "strata", "maya"),
+             "note": "llama.cpp, Strata or Maya: 262K window (the model's native length)"},
     # the standard fp8 launch with a longer MAX_LEN: the fp8 KV pool held
     # 196,229-197,744 tokens with the vision tower on (vLLM logs, 2026-09-03 and
     # 09-27); 190,464 (93 x 2048) keeps ~3 % below the smallest pool seen, since
@@ -4319,13 +4330,14 @@ def available_context_profiles(env=None):
 
 # Model catalogues per engine (dashboard "Model" dropdown): `id=path|label[|max=N]`
 # entries separated by `;`, the first is the default.  vLLM: a model directory
-# the launcher receives as MODEL; Strata: a setup-written strata-<model>.json.
+# the launcher receives as MODEL; Strata and Maya: a setup-written <engine>-<model>.json.
 # The persisted `<engine>_variant` setting picks one for the next restart.
-VARIANT_ENVS = {"vllm": "COLI_VLLM_VARIANTS", "strata": "COLI_STRATA_VARIANTS"}
+VARIANT_ENVS = {"vllm": "COLI_VLLM_VARIANTS", "strata": "COLI_STRATA_VARIANTS",
+                "maya": "COLI_MAYA_VARIANTS"}
 
 
 def variant_installed(backend, path):
-    return os.path.isfile(path) if backend == "strata" else os.path.isdir(path)
+    return os.path.isfile(path) if backend in CHAT_BACKENDS else os.path.isdir(path)
 
 
 def model_variants(backend, env=None):
@@ -4416,7 +4428,7 @@ def resolve_backend(requested=None, settings_file=None, env=None):
     env = os.environ if env is None else env
     choice = canonical_backend(requested or saved_backend(settings_file)
                                or env.get("COLI_BACKEND") or "aider")
-    # a profile only some engines serve (fast: vLLM, long: llama.cpp or Strata)
+    # a profile only some engines serve (fast: vLLM, long: llama.cpp, Strata or Maya)
     # holds the backend inside that set while it is selected
     allowed = profile_backends(saved_context_profile(settings_file), env)
     if not requested and allowed and choice not in allowed:
@@ -4425,7 +4437,8 @@ def resolve_backend(requested=None, settings_file=None, env=None):
         raise ValueError(f"unknown backend {choice!r} (one of {', '.join(BACKEND_IDS)})")
     if not backend_configured(choice, env):
         print(f"WARNING: backend {choice} is not configured "
-              f"(COLI_LLAMACPP_MODEL / COLI_VLLM_CMD / COLI_STRATA_CMD); serving with the AI-DER engine",
+              f"(COLI_LLAMACPP_MODEL / COLI_VLLM_CMD / COLI_STRATA_CMD / COLI_MAYA_CMD); "
+              f"serving with the AI-DER engine",
               file=sys.stderr)
         return "aider"
     return choice
@@ -4452,6 +4465,19 @@ def stable_prefix_cut(prompt, arch=None):
         return min((i for marker in ("<|im_start|>user\n", "<|im_start|>assistant\n")
                     if (i := prompt.find(marker)) > 0), default=0)
     return 0
+
+
+def vision_configured(backend, config):
+    """Whether a Strata / Maya config starts the image encoder: its "vision"
+    entry (Strata: with --vision among the args), and no `--vision off`.  Maya's
+    DeepSeek config (`--pack`) runs the tower inside the engine: the setup writes
+    `--vision off` when its pack has none."""
+    args = [str(a) for a in config.get("args") or []]
+    if "--vision" in args[:-1] and args[args.index("--vision") + 1] == "off":
+        return False
+    if backend == "strata":
+        return bool(config.get("vision")) and "--vision" in args
+    return bool(config.get("vision")) or "--pack" in args
 
 
 def _flag_value(args, names, default):
@@ -4496,10 +4522,10 @@ def _host_hwinfo():
 
 
 class ProxyEngine(Engine):
-    """An external inference server (llama.cpp's llama-server, vLLM or Strata)
+    """An external inference server (llama.cpp's llama-server, vLLM, Strata or Maya)
     spawned and owned by the gateway, driven through its OpenAI `/v1/completions`
-    endpoint with the gateway's own rendered prompt (Strata, which has none:
-    its chat endpoint, the reply re-serialized into the native text).  Same `generate()`
+    endpoint with the gateway's own rendered prompt (Strata and Maya, which have
+    none: their chat endpoint, the reply re-serialized into the native text).  Same `generate()`
     contract as `Engine`; the proxy holds the scheduler admission exactly like
     the native engine does.  One backend process at a time owns the GPU.
 
@@ -4612,27 +4638,30 @@ class ProxyEngine(Engine):
             self.max_images = int(environ.get("COLI_VLLM_IMAGES", "1"))
             self.media_marker = "[image]"
         else:
-            # Strata (github.com/Niko1221/Strata), an engine for this model: its
-            # Python server in front of the engine, started from a setup-written
-            # strata-<model>.json (COLI_STRATA_VARIANTS).  It has no raw-prompt
-            # endpoint, so every turn takes the chat path vLLM image turns take
-            # (prepare_images), with the thinking switch, effort and budget.
-            cmd = shlex.split(environ.get("COLI_STRATA_CMD", ""))
-            port = int(environ.get("COLI_STRATA_PORT", "8084"))
-            variants = model_variants("strata", environ)
-            self.variant = environ.get("COLI_STRATA_VARIANT")
+            # Strata (github.com/Niko1221/Strata), an engine for this model, and
+            # its fork Project Maya (github.com/mw00/project-maya: GLM-5.3-Flash and
+            # DeepSeek-V4.1-Flash): a Python server in front of the engine, started
+            # from a setup-written <engine>-<model>.json (COLI_<ENGINE>_VARIANTS).
+            # Neither has a raw-prompt endpoint, so every turn takes the chat path
+            # vLLM image turns take (prepare_images), with the thinking switch and
+            # effort (Strata: the budget too).
+            env_prefix = f"COLI_{backend.upper()}"
+            cmd = shlex.split(environ.get(f"{env_prefix}_CMD", ""))
+            port = int(environ.get(f"{env_prefix}_PORT", str(CHAT_BACKEND_PORTS[backend])))
+            variants = model_variants(backend, environ)
+            self.variant = environ.get(f"{env_prefix}_VARIANT")
             if self.variant not in variants:
                 self.variant = next(iter(variants), None)
             if self.variant is None:
-                raise ValueError("COLI_STRATA_VARIANTS names no model")
+                raise ValueError(f"{env_prefix}_VARIANTS names no model")
             source = variants[self.variant]["path"]
             config = json.loads(Path(source).read_text(encoding="utf-8"))
-            # the window: standard 131K or long 262K (the profiles Strata serves),
-            # capped by the model's `max`; the engine refuses a prompt plus
+            # the window: standard 131K or long 262K (the profiles these engines
+            # serve), capped by the model's `max`; the engine refuses a prompt plus
             # max_tokens past it unless fit_max_tokens shortens max_tokens
             self.context_profile = environ.get("COLI_CONTEXT_PROFILE") or "standard"
             if (self.context_profile not in CONTEXT_PROFILES or
-                    "strata" not in (CONTEXT_PROFILES[self.context_profile]["backends"] or ("strata",))):
+                    backend not in (CONTEXT_PROFILES[self.context_profile]["backends"] or (backend,))):
                 self.context_profile = "standard"
             self.context_window = CONTEXT_PROFILES[self.context_profile]["context"]
             cap = variants[self.variant]["max_context"]
@@ -4645,17 +4674,17 @@ class ProxyEngine(Engine):
             config["host"] = "127.0.0.1"
             config["fit_max_tokens"] = True
             config["open_browser"] = False
-            runtime = Path(environ.get("COLI_STRATA_RUNTIME")
-                           or Path.home() / ".cache" / "ai-der" / "strata")
+            runtime = Path(environ.get(f"{env_prefix}_RUNTIME")
+                           or Path.home() / ".cache" / "ai-der" / backend)
             runtime.mkdir(parents=True, exist_ok=True)
-            derived = runtime / f"strata-{self.variant}-{self.context_window}.json"
+            derived = runtime / f"{backend}-{self.variant}-{self.context_window}.json"
             derived.write_text(json.dumps(config, indent=1), encoding="utf-8")
             cmd = [*cmd, "--config", str(derived), "--port", str(port)]
-            self.cwd = config.get("cwd") or environ.get("COLI_STRATA_DIR") or None
+            self.cwd = config.get("cwd") or environ.get(f"{env_prefix}_DIR") or None
             model = str(config.get("model_name") or self.variant)
             self.upstream_model = model
-            self.images = "--vision" in config["args"] and bool(config.get("vision"))
-            self.max_images = int(environ.get("COLI_STRATA_IMAGES", "4"))
+            self.images = vision_configured(backend, config)
+            self.max_images = int(environ.get(f"{env_prefix}_IMAGES", "4"))
             self.media_marker = "[image]"
         self.command = cmd
         self.child_env = environ
@@ -4707,8 +4736,9 @@ class ProxyEngine(Engine):
     DEATH_GRACE = 5.0     # seconds an upstream gets to exit after failing a request
 
     # prefill-rate floors for the stall deadline (tok/s; measured cold: vLLM
-    # 680 at 188K and 1,450 at 3K, llama.cpp 176 at 261K)
-    STALL_PREFILL_RATE = {"vllm": 300, "llamacpp": 100, "strata": 400}
+    # 680 at 188K and 1,450 at 3K, llama.cpp 176 at 261K, Maya's DeepSeek
+    # 352 at 6K and 555 at 67K, its GLM 1,196-1,296)
+    STALL_PREFILL_RATE = {"vllm": 300, "llamacpp": 100, "strata": 400, "maya": 150}
 
     # -- lifecycle -----------------------------------------------------------
     def _start_process(self):
@@ -4814,9 +4844,9 @@ class ProxyEngine(Engine):
             time.sleep(1.0)
 
     def _health_ready(self, body):
-        """Strata answers /health at once and reports max_context 0 until its
-        engine is loaded; the other upstreams answer 200 only when ready."""
-        if self.backend_id != "strata":
+        """Strata and Maya answer /health at once and report max_context 0 until
+        their engine is loaded; the other upstreams answer 200 only when ready."""
+        if self.backend_id not in CHAT_BACKENDS:
             return True
         try:
             return int(json.loads(body or b"{}").get("max_context") or 0) > 0
@@ -4948,7 +4978,7 @@ class ProxyEngine(Engine):
         request whose slot does not hold that prefix restores the file before
         prefilling, so a repeated startup prefix survives restarts.  Returns
         the restored token count (0 when nothing was restored)."""
-        if self.backend_id == "strata":
+        if self.backend_id in CHAT_BACKENDS:
             return 0
         cut = stable_prefix_cut(prompt, self.arch)
         if cut < self.prefix_min_chars:
@@ -5243,6 +5273,7 @@ class ProxyEngine(Engine):
                                                           if prefilled and prefill_seconds else None))
         stats = {"completion_tokens": completion_tokens, "tokens_per_second": rate,
                  "cache_hit_percent": 0.0, "rss_gb": 0.0, "prompt_tokens": prompt_tokens,
+                 "cached_tokens": min(int(cached or 0), prompt_tokens),
                  "length_limited": last["finish_reason"] == "length" and not last["stop"]}
         meta = self._telemetry_request(request_id, remove=True)
         self._record_telemetry("generation_finished", request_id,
@@ -5320,15 +5351,17 @@ class ProxyEngine(Engine):
         body = {"model": self.upstream_model, "messages": chat["messages"], "max_tokens": max_tokens,
                 "temperature": temperature, "top_p": top_p, "stream": True,
                 "stream_options": {"include_usage": True},
-                "chat_template_kwargs": {"enable_thinking": thinking},
-                "top_k": SAMPLING_DEFAULTS[thinking]["top_k"]}
-        if getattr(self, "_presence", None):
-            body["presence_penalty"] = float(self._presence)
-        if self.backend_id == "strata":
-            if thinking and chat.get("reasoning_effort"):
-                body["chat_template_kwargs"]["reasoning_effort"] = chat["reasoning_effort"]
-            if chat.get("reasoning_budget"):
-                body["reasoning_budget_tokens"] = int(chat["reasoning_budget"])
+                "chat_template_kwargs": {"enable_thinking": thinking}}
+        # Maya serves GLM-5.3-Flash / DeepSeek-V4.1-Flash: Qwen's top_k and presence
+        # penalty defaults stay out (its config's model-card sampling applies)
+        if self.backend_id != "maya":
+            body["top_k"] = SAMPLING_DEFAULTS[thinking]["top_k"]
+            if getattr(self, "_presence", None):
+                body["presence_penalty"] = float(self._presence)
+        if self.backend_id in CHAT_BACKENDS and thinking and chat.get("reasoning_effort"):
+            body["chat_template_kwargs"]["reasoning_effort"] = chat["reasoning_effort"]
+        if self.backend_id == "strata" and chat.get("reasoning_budget"):
+            body["reasoning_budget_tokens"] = int(chat["reasoning_budget"])
         if chat.get("tools"):
             body["tools"] = chat["tools"]
             if chat.get("tool_choice") in ("auto", "none", "required"):
@@ -5507,14 +5540,14 @@ class ProxyEngine(Engine):
 
     def prepare_images(self, messages, tools, tool_choice, enable_thinking, reasoning_effort=None):
         """P6.5: the request's image parts for this proxy.  Returns (messages
-        for the gateway's renderer, ProxyImages or None).  On Strata every turn
-        carries the chat request (it has no raw-prompt endpoint)."""
+        for the gateway's renderer, ProxyImages or None).  On Strata and Maya every
+        turn carries the chat request (they have no raw-prompt endpoint)."""
         placeholder = self.media_marker
-        if self.backend_id == "strata":
+        if self.backend_id in CHAT_BACKENDS:
             rewritten, media = collect_proxy_images(messages, placeholder)
             if media and not self.images:
-                raise APIError(400, "The Strata backend was started without its vision encoder.",
-                               "messages", "unsupported_content_type")
+                raise APIError(400, f"The {self.backend['label']} backend was started without its "
+                                    "vision encoder.", "messages", "unsupported_content_type")
             chat = {"messages": proxy_chat_messages(messages, self.max_images), "tools": tools,
                     "tool_choice": tool_choice, "enable_thinking": enable_thinking,
                     "reasoning_effort": reasoning_effort if enable_thinking else None}
@@ -6826,11 +6859,21 @@ class APIHandler(BaseHTTPRequestHandler):
             return True
 
     @staticmethod
-    def usage(stats):
+    def cached_tokens(stats):
+        """Prompt tokens the engine served from its cache (KV slot, prompt pool,
+        the upstream's prefix or conversation cache), at most the prompt."""
+        cached = stats.get("cached_tokens")
+        if cached is None:
+            cached = stats.get("restored_tokens")
+        return max(0, min(int(cached or 0), int(stats.get("prompt_tokens") or 0)))
+
+    @classmethod
+    def usage(cls, stats):
         prompt = stats["prompt_tokens"]
         completion = stats["completion_tokens"]
         return {"prompt_tokens": prompt, "completion_tokens": completion,
-                "total_tokens": prompt + completion}
+                "total_tokens": prompt + completion,
+                "prompt_tokens_details": {"cached_tokens": cls.cached_tokens(stats)}}
 
     _prompt_spans = None
 
@@ -7110,8 +7153,14 @@ class APIHandler(BaseHTTPRequestHandler):
                                "messages", "context_length_exceeded")
 
         def usage(stats):
-            # token_scale: see client_token_scale
-            return {"input_tokens": round(int(stats.get("prompt_tokens") or 0) * token_scale),
+            # Anthropic's split: input_tokens is the part of the prompt read fresh,
+            # cache_read_input_tokens the part served from the cache (clients add them
+            # up for the context fill); token_scale: see client_token_scale
+            cached = self.cached_tokens(stats)
+            fresh = int(stats.get("prompt_tokens") or 0) - cached
+            return {"input_tokens": round(fresh * token_scale),
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": round(cached * token_scale),
                     "output_tokens": round(int(stats.get("completion_tokens") or 0) * token_scale)}
         # thinking budget (Anthropic `thinking.budget_tokens` or the dashboard default)
         budget = body.get("thinking_budget") if enable_thinking else None
@@ -7485,7 +7534,7 @@ class APIHandler(BaseHTTPRequestHandler):
                    "usage": None}
             if stats is not None:
                 obj["usage"] = {"input_tokens": stats["prompt_tokens"],
-                                "input_tokens_details": {"cached_tokens": stats.get("restored_tokens") or 0},
+                                "input_tokens_details": {"cached_tokens": self.cached_tokens(stats)},
                                 "output_tokens": stats["completion_tokens"],
                                 "output_tokens_details": {"reasoning_tokens": 0},
                                 "total_tokens": stats["prompt_tokens"] + stats["completion_tokens"]}

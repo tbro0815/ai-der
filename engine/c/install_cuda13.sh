@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AI-DER: a private CUDA 13 toolkit for the Strata and llama.cpp builds, assembled from NVIDIA's
+# AI-DER: a private CUDA 13 toolkit for the Strata, Maya and llama.cpp builds, assembled from NVIDIA's
 # pip wheels into $AI_DER_DATA/cuda13 (bin, include, lib, nvvm). The system toolkit is left alone.
 # Ubuntu 26.04's glibc (2.41+) declares rsqrt/rsqrtf noexcept, which CUDA 13.0's math_functions.h
 # does not; when a test compile shows that conflict, the view carries a private copy of that one
@@ -15,7 +15,8 @@ say() { echo "AI-DER CUDA 13: $*"; }
 fail() { echo "AI-DER CUDA 13: $*" >&2; exit 1; }
 [[ -x $uv ]] || fail "no uv at $uv; run ./install.sh first."
 
-if [[ -x $view/bin/nvcc && -f $view/.ready ]]; then
+# (a view from before Maya lacks the profiler and NVTX headers its engine includes, and links nvcc)
+if [[ -x $view/bin/nvcc && ! -L $view/bin/nvcc && -f $view/.ready && -e $view/include/cuda_profiler_api.h ]]; then
     say "toolkit view present at $view, skipping"
     exit 0
 fi
@@ -23,7 +24,8 @@ say "NVIDIA's CUDA 13 wheels -> $venv"
 [[ -x $venv/bin/python ]] || "$uv" venv --quiet --python 3.12 "$venv"
 "$uv" pip install --quiet --python "$venv/bin/python" \
     nvidia-cuda-nvcc==13.0.88 nvidia-cuda-crt==13.0.88 nvidia-cuda-runtime==13.0.96 \
-    nvidia-cublas==13.1.1.3 nvidia-nvvm==13.0.88 nvidia-cuda-cccl==13.0.85
+    nvidia-cublas==13.1.1.3 nvidia-nvvm==13.0.88 nvidia-cuda-cccl==13.0.85 \
+    nvidia-cuda-profiler-api==13.0.85 nvidia-nvtx==13.0.85
 cu=$("$venv/bin/python" -c 'import os, nvidia; print(os.path.join(list(nvidia.__path__)[0], "cu13"))')
 [[ -x $cu/bin/nvcc ]] || fail "no nvcc in $cu after the install."
 
@@ -32,6 +34,10 @@ cu=$("$venv/bin/python" -c 'import os, nvidia; print(os.path.join(list(nvidia.__
 say "toolkit view -> $view"
 rm -rf "$view"; mkdir -p "$view/bin" "$view/nvvm" "$view/include/crt" "$view/lib"
 for d in bin nvvm; do for e in "$cu/$d"/*; do ln -s "$e" "$view/$d/"; done; done
+# nvcc itself a copy: Maya's setup takes CUDAToolkit_ROOT from nvcc's resolved path, and a link
+# would point it at the wheel, whose lib has no unversioned libcudart.so (the build then links a
+# system CUDA 12 runtime, or none)
+rm "$view/bin/nvcc"; cp "$cu/bin/nvcc" "$view/bin/nvcc"
 for e in "$cu/include"/*; do [[ $(basename "$e") == crt ]] || ln -s "$e" "$view/include/"; done
 for e in "$cu/include/crt"/*; do ln -s "$e" "$view/include/crt/"; done
 for f in "$cu/lib"/*.so.* "$cu/lib"/*.a; do

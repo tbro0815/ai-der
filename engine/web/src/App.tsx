@@ -222,7 +222,7 @@ export default function App() {
   const [connecting, setConnecting] = useState(false)
   const [restarting, setRestarting] = useState(false)
   const [switchingBackend, setSwitchingBackend] = useState(false)
-  const backendLabel = (id: string) => ({ aider: "AI-DER", llamacpp: "llama.cpp", vllm: "vLLM", strata: "Strata" } as Record<string, string>)[id] || id
+  const backendLabel = (id: string) => ({ aider: "AI-DER", llamacpp: "llama.cpp", vllm: "vLLM", strata: "Strata", maya: "Maya" } as Record<string, string>)[id] || id
   const chooseBackend = async (backend: string) => {
     if (!serverSettings || backend === serverSettings.backend_next) return
     setSwitchingBackend(true)

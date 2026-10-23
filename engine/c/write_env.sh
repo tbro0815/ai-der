@@ -10,6 +10,7 @@ gguf_dir=$data/models/qwen38-flash-next
 llamacpp=$data/llama.cpp/build/bin/llama-server
 vllm_dir=$data/vllm/qwen38-27b-rtx3090
 strata_dir=$data/strata
+maya_dir=$data/maya
 env_file=$root/ai-der.env
 threads=$(( $(nproc) / 2 )); (( threads >= 4 )) || threads=4
 say() { echo "AI-DER env: $*"; }
@@ -63,7 +64,7 @@ EOF
 else echo "# vLLM backend not installed (engine/c/install_vllm.sh)"; fi
 strata_variants=""
 for entry in "gsq-iq3s=strata-iq3_s.json|Qwen3.8-Flash-Next GSQ-RCO IQ3_S" \
-             "uncensored-iq3s=strata-uncensored-i1-iq3_s.json|Qwen3.8-Flash-Next Uncensored i1-IQ3_S (OrcaRouter, mradermacher)" \
+             "uncensored-iq3s=strata-davidau-abliterated-iq3s.json|Qwen3.8-Flash-Next Abliterated Uncensored GSQ-RCO IQ3_S (DavidAU)" \
              "ud-iq4xs=strata-unsloth-ud-iq4_xs.json|Qwen3.8-Flash-Next UD-IQ4_XS (unsloth)"; do
     id=${entry%%=*}; rest=${entry#*=}; file=${rest%%|*}; label=${rest#*|}
     if [[ -f $strata_dir/$file ]]; then strata_variants+="${strata_variants:+;}$id=$strata_dir/$file|$label"; fi
@@ -77,6 +78,22 @@ COLI_STRATA_RUNTIME=$HOME/.cache/ai-der/strata
 COLI_STRATA_VARIANTS="$strata_variants"
 EOF
 else echo "# Strata backend not installed (engine/c/install_strata.sh)"; fi
+maya_variants=""
+for entry in "glm-s24=maya-maya-s24.json|GLM-5.3-Flash Maya-S24" \
+             "glm-m-derisked=maya-maya-m-derisked.json|GLM-5.3-Flash Maya-M-Derisked" \
+             "ds4-s=maya-ds4.json|DeepSeek-V4.1-Flash Maya-S"; do
+    id=${entry%%=*}; rest=${entry#*=}; file=${rest%%|*}; label=${rest#*|}
+    if [[ -f $maya_dir/$file ]]; then maya_variants+="${maya_variants:+;}$id=$maya_dir/$file|$label"; fi
+done
+if [[ -x $maya_dir/.venv/bin/python && -n $maya_variants ]]; then cat <<EOF
+# ---- Maya backend (GLM-5.3-Flash, DeepSeek-V4.1-Flash; models: id=maya-<model>.json|label) ----
+COLI_MAYA_CMD="$maya_dir/.venv/bin/python $maya_dir/serve/server.py --engine strata"
+COLI_MAYA_PORT=8085
+COLI_MAYA_DIR=$maya_dir
+COLI_MAYA_RUNTIME=$HOME/.cache/ai-der/maya
+COLI_MAYA_VARIANTS="$maya_variants"
+EOF
+else echo "# Maya backend not installed (engine/c/install_maya.sh)"; fi
 cat <<EOF
 # ---- LAN serving (off by default; see README) ----
 # COLI_API_KEY=change-me

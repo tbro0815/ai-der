@@ -1483,14 +1483,15 @@ class HTTPTest(unittest.TestCase):
         with patch.dict("os.environ", env), patch.object(self.server, "context_window", 100):
             with self.request("/v1/messages", body) as response:
                 usage = json.load(response)["usage"]
-            self.assertEqual(usage, {"input_tokens": 14, "output_tokens": 4})     # FakeEngine 7/2, x2
+            self.assertEqual(usage, {"input_tokens": 14, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 4})     # FakeEngine 7/2, x2
             with self.request("/v1/messages", dict(body, stream=True)) as response:
                 events = [json.loads(line[5:]) for line in response.read().decode().splitlines()
                           if line.startswith("data:")]
             delta = [e for e in events if e["type"] == "message_delta"][0]
-            self.assertEqual(delta["usage"], {"input_tokens": 14, "output_tokens": 4})
+            self.assertEqual(delta["usage"], {"input_tokens": 14, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 4})
             with self.request("/v1/messages", dict(body, model="test-model")) as response:
-                self.assertEqual(json.load(response)["usage"], {"input_tokens": 7, "output_tokens": 2})
+                self.assertEqual(json.load(response)["usage"], {"input_tokens": 7, "cache_creation_input_tokens": 0,
+                                                                "cache_read_input_tokens": 0, "output_tokens": 2})
             with patch.dict("os.environ", {"COLI_CLIENT_ASSUMED_WINDOW": ""}):
                 with self.request("/v1/messages/count_tokens", body) as response:
                     plain = json.load(response)["input_tokens"]
@@ -1559,6 +1560,34 @@ class HTTPTest(unittest.TestCase):
         with self.request("/v1/messages", dict(body, stop_sequences=None, messages=[
                 {"role": "system", "content": "env"}, {"role": "user", "content": "hi"}])) as response:
             self.assertEqual(response.status, 200)
+
+    def test_cached_prompt_tokens_reach_every_api(self):
+        real = self.engine.generate
+
+        def cached(*args, **kwargs):
+            return dict(real(*args, **kwargs), cached_tokens=5)       # 7 prompt tokens, 5 from the cache
+        with patch.object(self.engine, "generate", side_effect=cached):
+            with self.request("/v1/chat/completions", {"model": "test-model", "max_tokens": 8,
+                                                       "messages": [{"role": "user", "content": "Hi"}]}) as response:
+                self.assertEqual(json.load(response)["usage"]["prompt_tokens_details"], {"cached_tokens": 5})
+            body = {"model": "test-model", "max_tokens": 8, "thinking": {"type": "disabled"},
+                    "messages": [{"role": "user", "content": "Hi"}]}
+            with self.request("/v1/messages", body) as response:
+                usage = json.load(response)["usage"]
+            self.assertEqual((usage["input_tokens"], usage["cache_read_input_tokens"], usage["output_tokens"]), (2, 5, 2))
+            with self.request("/v1/messages", dict(body, stream=True)) as response:
+                events = [json.loads(line[5:]) for line in response.read().decode().splitlines()
+                          if line.startswith("data:")]
+            delta = [e for e in events if e["type"] == "message_delta"][0]["usage"]
+            self.assertEqual((delta["input_tokens"], delta["cache_read_input_tokens"]), (2, 5))
+            # alias ids on the client's assumed window: both parts scaled
+            with patch.dict("os.environ", {"COLI_MODEL_ALIASES": "claude-*", "COLI_CLIENT_ASSUMED_WINDOW": "200"}), \
+                 patch.object(self.server, "context_window", 100):
+                with self.request("/v1/messages", dict(body, model="claude-sonnet-5")) as response:
+                    usage = json.load(response)["usage"]
+            self.assertEqual((usage["input_tokens"], usage["cache_read_input_tokens"]), (4, 10))
+            with self.request("/v1/responses", {"model": "test-model", "max_output_tokens": 8, "input": "Hi"}) as response:
+                self.assertEqual(json.load(response)["usage"]["input_tokens_details"], {"cached_tokens": 5})
 
     def test_models_list_advertises_claude_aliases_in_both_shapes(self):
         with patch.dict("os.environ", {"COLI_ADVERTISED_MODELS": "claude-opus-5-5, claude-sonnet-5"}):
@@ -1810,7 +1839,8 @@ class HTTPTest(unittest.TestCase):
             queue_wait = response.headers.get("x-colibri-queue-wait-ms")
         self.assertEqual(body["object"], "chat.completion")
         self.assertEqual(body["choices"][0]["message"]["content"], "Héllo")
-        self.assertEqual(body["usage"], {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9})
+        self.assertEqual(body["usage"], {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9,
+                                         "prompt_tokens_details": {"cached_tokens": 0}})
         self.assertIsNotNone(queue_wait)
         self.assertIn("<|user|>Hi<|assistant|><think></think>", self.engine.calls[-1][0])
         self.assertEqual(self.engine.calls[-1][4], 1)
@@ -2066,7 +2096,8 @@ class HTTPTest(unittest.TestCase):
         self.assertIn('\"delta\":{\"role\":\"assistant\",\"content\":\"\"}', stream)
         self.assertIn('\"object\":\"chat.completion.chunk\"', stream)
         self.assertIn('\"content\":\"Hé\"', stream)
-        self.assertIn('\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}', stream)
+        self.assertIn('\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9,'
+                      '\"prompt_tokens_details\":{\"cached_tokens\":0}}', stream)
         self.assertTrue(stream.endswith("data: [DONE]\n\n"))
 
     def test_streaming_stop_never_exposes_partial_sequence(self):
@@ -3834,13 +3865,101 @@ class ProxyEngineTest(unittest.TestCase):
             self.assertEqual(request["model"], "qwen3.8-flash-next-iq3_s")
             self.assertEqual([m["role"] for m in request["messages"]], ["system", "user"])
             self.assertEqual("".join(out), "think </think>Answer.")
-            self.assertEqual(stats["prompt_tokens"], 40)
+            self.assertEqual((stats["prompt_tokens"], stats["cached_tokens"]), (40, 12))
             # thinking off: no effort, no budget
             _, image = engine.prepare_images([{"role": "user", "content": "q"}], None, None, False, None)
             engine.generate("x", 8, 0.0, 0.9, lambda _: None, image=image)
             request = [b for p, b in _UpstreamHandler.seen if p == "/v1/chat/completions"][-1]
             self.assertEqual(request["chat_template_kwargs"], {"enable_thinking": False})
             self.assertNotIn("reasoning_budget_tokens", request)
+            engine.close()
+
+    def _maya_env(self, tmp):
+        glm = {"exe": "/srv/maya/build/maya", "cwd": "/srv/maya",
+               "args": ["--glm-pack", "/p", "--max-context", "131072", "--kv-streaming", "on"],
+               "vision": {"exe": "/srv/maya/build/maya-vision", "gpu": True}, "model_name": "glm-5.3-flash",
+               "sampling": {"temperature": 1.0, "top_p": 0.95}, "port": 8080}
+        ds4 = {"exe": "/srv/maya/build/maya-ds4", "cwd": "/srv/maya",
+               "args": ["--pack", "/d", "--max-context", "65536", "--tp", "2", "--vision", "off"],
+               "model_name": "deepseek-v4.1-flash", "port": 8080}
+        Path(tmp, "maya-s24.json").write_text(json.dumps(glm))
+        Path(tmp, "maya-ds4.json").write_text(json.dumps(ds4))
+        ds4["args"] = ds4["args"][:-2]                    # the tower in the pack
+        Path(tmp, "maya-ds4-vision.json").write_text(json.dumps(ds4))
+        return {"COLI_MAYA_CMD": "/srv/maya/.venv/bin/python /srv/maya/serve/server.py --engine strata",
+                "COLI_MAYA_PORT": str(self.upstream.server_address[1]), "COLI_MAYA_RUNTIME": tmp,
+                "COLI_MAYA_VARIANTS": f"glm-s24={tmp}/maya-s24.json|GLM-5.3-Flash Maya-S24; "
+                                      f"ds4-s={tmp}/maya-ds4.json|DeepSeek-V4.1-Flash Maya-S|max=131072; "
+                                      f"ds4-v={tmp}/maya-ds4-vision.json|DeepSeek-V4.1-Flash Maya-S, images"}
+
+    def test_maya_starts_from_its_setup_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._maya_env(tmp)
+            self.assertIn("maya", openai_server.available_backends(env))
+            self.assertIn("maya", openai_server.profile_backends("long", env))
+            with patch("openai_server.ARCH", "qwen38"):
+                glm = ProxyEngine("maya", "qwen3.8-flash-next-aider",
+                                  env=dict(env, COLI_CONTEXT_PROFILE="long"), spawn=False)
+                ds4 = ProxyEngine("maya", "qwen3.8-flash-next-aider",
+                                  env=dict(env, COLI_CONTEXT_PROFILE="long", COLI_MAYA_VARIANT="ds4-s"), spawn=False)
+                fast = ProxyEngine("maya", "qwen3.8-flash-next-aider",
+                                   env=dict(env, COLI_CONTEXT_PROFILE="fast"), spawn=False)
+                ds4v = ProxyEngine("maya", "qwen3.8-flash-next-aider",
+                                   env=dict(env, COLI_MAYA_VARIANT="ds4-v"), spawn=False)
+            for engine, variant, window, images in ((glm, "glm-s24", 262144, True), (ds4, "ds4-s", 131072, False),
+                                                    (fast, "glm-s24", 131072, True), (ds4v, "ds4-v", 131072, True)):
+                self.assertEqual((engine.backend["variant"], engine.context_window, engine.images),
+                                 (variant, window, images))
+                derived = engine.command[engine.command.index("--config") + 1]
+                self.assertEqual(Path(derived).name, f"maya-{variant}-{window}.json")
+                cfg = json.loads(Path(derived).read_text())
+                self.assertEqual(cfg["args"][cfg["args"].index("--max-context") + 1], str(window))
+                self.assertEqual((cfg["port"], cfg["host"], cfg["fit_max_tokens"]),
+                                 (int(env["COLI_MAYA_PORT"]), "127.0.0.1", True))
+                self.assertEqual(engine.command[:2], ["/srv/maya/.venv/bin/python", "/srv/maya/serve/server.py"])
+                self.assertEqual(engine.cwd, "/srv/maya")
+                self.assertEqual(engine.backend["label"], "Maya")
+                engine.close()
+            self.assertEqual(ds4.upstream_model, "deepseek-v4.1-flash")
+            self.assertEqual(fast.backend["profile"], "standard")       # fast is vLLM-only
+            self.assertFalse(glm._health_ready(b'{"status": "ok", "max_context": 0}'))
+            self.assertTrue(glm._health_ready(b'{"status": "ok", "max_context": 262144}'))
+            # the port defaults to Maya's own, beside Strata's 8084
+            env.pop("COLI_MAYA_PORT")
+            with patch("openai_server.ARCH", "qwen38"):
+                engine = ProxyEngine("maya", "qwen3.8-flash-next-aider", env=env, spawn=False)
+            self.assertEqual(engine.port, 8085)
+            engine.close()
+
+    def test_maya_turns_take_the_chat_path_without_qwen_sampling(self):
+        _UpstreamHandler.script = {
+            "status": 200, "prompt_tokens": 30, "cache_n": 0,
+            "chat_deltas": [{"reasoning_content": "plan "},
+                            {"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "note", "arguments": "{}"}}]}],
+            "chat_finish": "tool_calls"}
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("openai_server.ARCH", "qwen38"):
+                engine = ProxyEngine("maya", "qwen3.8-flash-next-aider", env=self._maya_env(tmp), spawn=False)
+            engine.process = FakeProcess(lambda *_: None)
+            tools = [{"type": "function", "function": {"name": "note", "parameters": {"type": "object"}}}]
+            _, image = engine.prepare_images([{"role": "user", "content": "q"}], tools, "auto", True, "xhigh")
+            out = []
+            engine.generate("x", 64, 1.0, 0.95, out.append, image=image, reasoning_budget=128,
+                            presence_penalty=1.5)
+            request = [b for p, b in _UpstreamHandler.seen if p == "/v1/chat/completions"][-1]
+            self.assertEqual(request["chat_template_kwargs"], {"enable_thinking": True, "reasoning_effort": "xhigh"})
+            self.assertEqual(request["model"], "glm-5.3-flash")
+            self.assertEqual(request["tool_choice"], "auto")
+            for key in ("top_k", "presence_penalty", "reasoning_budget_tokens"):
+                self.assertNotIn(key, request)
+            text = "".join(out)
+            self.assertTrue(text.startswith("plan </think>"))
+            self.assertIn("<tool_call>", text)
+            # images need the encoder in the config
+            with self.assertRaises(APIError):
+                engine.images = False
+                engine.prepare_images([{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": PNG_URI}}]}], None, None, False)
             engine.close()
 
     def test_vllm_image_turns_use_the_chat_endpoint_and_native_text(self):

@@ -1,4 +1,4 @@
-# AI-DER 1.4.0
+# AI-DER 1.5.0
 
 **Artificial Intelligence Distributed Engram Runner** is a local inference runner
 for Qwen3.8-Flash-Next quantized mixture-of-experts models. It combines SSD-backed
@@ -39,7 +39,7 @@ sudo apt-get update
 sudo apt-get install -y git
 git clone https://github.com/tbro0815/ai-der.git
 cd ai-der
-git checkout v1.4.0
+git checkout v1.5.0
 ./install.sh --check
 ./install.sh
 ```
@@ -57,7 +57,7 @@ Run the installer as your normal user. The default installation does everything:
    engine container conversion and the MTP container (BF16 to Q8_0). Tens of
    minutes after the download; every step resumes on rerun.
 3. **CUDA 13 toolkit** (`engine/c/install_cuda13.sh`): NVIDIA's pip wheels assembled
-   into `~/ai-der-data/cuda13` for the llama.cpp and Strata builds; the system toolkit
+   into `~/ai-der-data/cuda13` for the llama.cpp, Strata and Maya builds; the system toolkit
    is left alone. On glibc 2.41+ (Ubuntu 26.04) the view carries a private copy of
    `crt/math_functions.h` whose `rsqrt`/`rsqrtf` declarations match glibc's.
 4. **llama.cpp backend** (`engine/c/install_llamacpp.sh`): `llama-server` built with
@@ -69,16 +69,22 @@ Run the installer as your normal user. The default installation does everything:
    variant) and the stack's vLLM patches.
 6. **Strata backend** (`engine/c/install_strata.sh`): [Strata](https://github.com/Niko1221/Strata),
    an inference engine for Qwen3.8-Flash-Next, built from source at a pinned revision,
-   with three models: ISTA-DASLab's GSQ-RCO IQ3_S pack, mradermacher's i1-IQ3_S of
-   OrcaRouter's Qwen3.8-Flash-Next-Uncensored (packed with Strata's `iq_pack.py
-   --compat-bf16`) and the UD-IQ4_XS GGUF from step 2. `AI_DER_STRATA_MODELS=gsq,uncensored,ud`
+   with three models: ISTA-DASLab's GSQ-RCO IQ3_S pack, DavidAU's abliterated
+   (uncensored) GSQ-RCO IQ3_S and the UD-IQ4_XS GGUF from step 2. `AI_DER_STRATA_MODELS=gsq,uncensored,ud`
    picks a subset.
-7. **`ai-der.env`** in the checkout: the serving environment for all installed
+7. **Maya backend** (`engine/c/install_maya.sh`, only with `--with-maya`):
+   [Project Maya](https://github.com/mw00/project-maya), Strata's fork for
+   GLM-5.3-Flash and DeepSeek-V4.1-Flash, built from source at a pinned revision, with
+   its own setup per model (download with sha256 checks, pack, vision encoder):
+   GLM-5.3-Flash Maya-S24 and Maya-M-Derisked, DeepSeek-V4.1-Flash Maya-S (about
+   560 GB together). `AI_DER_MAYA_MODELS=glm-s24,glm-m-derisked,ds4-s` picks a subset.
+8. **`ai-der.env`** in the checkout: the serving environment for all installed
    backends. `--systemd` also writes `~/.config/systemd/user/ai-der.service`.
 
 Everything lands under `~/ai-der-data` (`--data-dir DIR` changes it). Flags:
 `--core-only` installs the engine and dashboard only, `--skip-models`,
-`--skip-llamacpp`, `--skip-vllm` and `--skip-strata` drop one component, `--no-apt` skips the sudo
+`--skip-llamacpp`, `--skip-vllm` and `--skip-strata` drop one component, `--with-maya` adds
+the Maya backend, `--no-apt` skips the sudo
 step on a provisioned host. Keep the checkout in place: the editable command runs
 its engine sources here. The full download-and-convert path is long (an hour or
 more, dominated by the 95 GB download and the conversion) and was assembled from
@@ -97,9 +103,9 @@ Open `http://127.0.0.1:8080` in a browser for the dashboard; the API base URL is
 `http://127.0.0.1:8080/v1`. The default backend is AI-DER. The Extra section of the
 dashboard selects, for the next restart, the context profile first: `standard`
 (131K, every engine), `fast` (80K, vLLM only), `vllm-190k` (190K, vLLM only) or
-`long` (262K, llama.cpp or Strata). The engine list then offers the engines that
+`long` (262K, llama.cpp, Strata or Maya). The engine list then offers the engines that
 serve that profile, and the model list the models of the chosen engine (vLLM's
-27B models, Strata's three).
+27B models, Strata's three, Maya's GLM-5.3-Flash and DeepSeek-V4.1-Flash models).
 With `--systemd`: `systemctl --user enable --now ai-der.service`.
 
 **Web search in the chat.** Enter a [Serper](https://serper.dev) API key in the
@@ -137,7 +143,7 @@ Qwen repository and `engine/c/convert_mtp.py` writes `<container>/mtp`.
 Python package metadata and `ai-der --version` (`coli` remains an alias).
 Use semantic versioning: MAJOR for incompatible changes, MINOR for compatible
 features, PATCH for fixes. Releases are tagged `vMAJOR.MINOR.PATCH`; this release
-is **v1.4.0**. Internal upstream component metadata is independent.
+is **v1.5.0**. Internal upstream component metadata is independent.
 
 ```bash
 .venv/bin/ai-der --version

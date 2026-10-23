@@ -3,8 +3,8 @@
 # Qwen3.8-Flash-Next: built from source at a pinned revision against the private CUDA 13 toolkit
 # (engine/c/install_cuda13.sh), plus up to three models, each with its strata-<model>.json:
 #   gsq         ISTA-DASLab's GSQ-RCO IQ3_S pack (~84 GB download)
-#   uncensored  mradermacher's i1-IQ3_S of OrcaRouter's Qwen3.8-Flash-Next-Uncensored (~89 GB),
-#               packed for Strata's kernels with its tools/iq_pack.py --compat-bf16
+#   uncensored  DavidAU's abliterated GSQ-RCO IQ3_S (~84 GB; from SC117's abliteration of the
+#               GSQ-RCO pack), packed like the GSQ-RCO model with Strata's tools/iq_pack.py
 #   ud          unsloth's UD-IQ4_XS, the GGUF install_models.sh already downloaded (no download)
 # Every config computes all routed experts (STRATA_ROUTE_TAIL_SKIP=0); Strata's experimental
 # speed projection stays off. AI_DER_STRATA_MODELS picks the models (default: gsq,uncensored,ud).
@@ -57,38 +57,41 @@ if [[ $want == *gsq* ]]; then
     fi
 fi
 if [[ $want == *uncensored* ]]; then
-    uncensored=$models/uncensored-i1/Qwen3.8-Flash-Next-Uncensored.i1-IQ3_S.gguf
-    if [[ -f strata-uncensored-i1-iq3_s.json ]]; then say "uncensored i1-IQ3_S configured, skipping"
+    ab=$models/davidau-abliterated
+    if [[ -f strata-davidau-abliterated-iq3s.json ]]; then say "abliterated GSQ-RCO IQ3_S configured, skipping"
     else
-        say "uncensored i1-IQ3_S (mradermacher, ~89 GB)"
-        "$hf" download mradermacher/Qwen3.8-Flash-Next-Uncensored-i1-GGUF \
-            Qwen3.8-Flash-Next-Uncensored.i1-IQ3_S.gguf --local-dir "$models/uncensored-i1"
+        say "abliterated GSQ-RCO IQ3_S (DavidAU, ~84 GB)"
+        "$hf" download DavidAU/Qwen3.8-Flash-Next-Abliterated-Uncensored-Turbo-Brilliance-50x-Reasoning-Instruct-GSQ-RCO-GGUF \
+            Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf \
+            Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00002-of-00002.gguf --local-dir "$ab"
+        s1=$ab/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf
+        s2=$ab/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00002-of-00002.gguf
         [[ -d third_party/llama.cpp/gguf-py ]] || fail "no gguf-py in $dir/third_party/llama.cpp (a setup.sh run brings it)"
-        # the hyper-connection and small attention projections Strata's kernels read as BF16
+        # its own dense weights and tokenizer (the abliteration changed the dense side): the
+        # same pack step setup runs for the GSQ-RCO model
         STRATA_GGUF_PY=$dir/third_party/llama.cpp/gguf-py .venv/bin/python tools/iq_pack.py \
-            --gguf "$uncensored" --out "$sdata/packs/uncensored-i1-iq3_s" --compat-bf16
-        # its config: the IQ3_S config (same expert layout) pointed at this pack and file
-        .venv/bin/python - "$uncensored" "$sdata" <<'EOF'
+            --gguf "$s1" --out "$sdata/packs/davidau-abliterated-iq3s"
+        [[ -f $sdata/packs/davidau-abliterated-iq3s/tokenizer/vocab.json ]] || \
+            STRATA_GGUF_PY=$dir/third_party/llama.cpp/gguf-py .venv/bin/python tools/strata_tokenizer.py \
+                --gguf "$s1" --out "$sdata/packs/davidau-abliterated-iq3s"
+        # its config: the GSQ-RCO IQ3_S config (same layout) pointed at these shards and this pack
+        [[ -f strata-iq3_s.json ]] || fail "the abliterated model's config is made from the GSQ-RCO one (AI_DER_STRATA_MODELS needs gsq)"
+        .venv/bin/python - "$s1" "$s2" "$sdata" <<'EOF'
 import json, os, sys
-gguf, sdata = sys.argv[1], sys.argv[2]
-template = next(f for f in ("strata-iq3_s.json", "strata-unsloth-ud-iq4_xs.json") if os.path.isfile(f))
-cfg = json.load(open(template))
+s1, s2, sdata = sys.argv[1:4]
+pack = os.path.join(sdata, "packs", "davidau-abliterated-iq3s")
+cfg = json.load(open("strata-iq3_s.json"))
 a = cfg["args"]
-a[a.index("--pack") + 1] = os.path.join(sdata, "packs", "uncensored-i1-iq3_s")
-a[a.index("--native") + 1] = gguf
-if "--ple-gguf" in a:
-    a[a.index("--ple-gguf") + 1] = gguf
-else:
-    a += ["--ple-gguf", gguf]
+a[a.index("--pack") + 1] = pack
+a[a.index("--native") + 1] = s1
+a[a.index("--ple-gguf") + 1] = s2
 cfg["args"] = cfg["args_written"] = a
-env = {k: v for k, v in (cfg.get("env") or {}).items() if k != "STRATA_HC_Q8"}   # unsloth's Q8 hyper-connections only
-cfg["env"] = env
-cfg["tokenizer"] = os.path.join(sdata, "packs", "uncensored-i1-iq3_s", "tokenizer")
-cfg["model_name"] = "qwen3.8-flash-next-uncensored-i1-iq3_s"
-cfg["log"] = os.path.join(os.getcwd(), "strata-uncensored-i1-iq3_s.log")
+cfg["tokenizer"] = os.path.join(pack, "tokenizer")
+cfg["model_name"] = "qwen3.8-flash-next-davidau-abliterated-iq3_s"
+cfg["log"] = os.path.join(os.getcwd(), "strata-davidau-abliterated-iq3s.log")
 if cfg.get("vision"):
-    cfg["vision"]["model"] = gguf
-json.dump(cfg, open("strata-uncensored-i1-iq3_s.json", "w"), indent=1)
+    cfg["vision"]["model"] = s1
+json.dump(cfg, open("strata-davidau-abliterated-iq3s.json", "w"), indent=1)
 EOF
     fi
 fi
