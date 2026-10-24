@@ -37,7 +37,7 @@ import { Textarea } from "@/components/ui/textarea"
 import { pickSuggestions } from "@/prompts"
 import { WEB_SEARCH_TOOLS, parseWebSearchResult } from "@/tools"
 import { type PrefillProgress, getHealth, getServerSettings, listModels, resetCache, restartServer, streamChat, updateApiDefaults, updateServerBackend, updateContextProfile, updateVariant, webSearch as webSearchCall, updateServerSettings, withSystemPrompt, type ChatMessage, type HealthResponse, type ServerSettings, type StreamChatResult } from "@/lib/api"
-import { activeRequests, decodeTokensPerSecond, supportsCacheSlots } from "@/lib/runtime"
+import { activeRequests, decodeTokensPerSecond, showApiSpeed, supportsCacheSlots } from "@/lib/runtime"
 import { Brain } from "./Brain"
 import { Profiling } from "./Profiling"
 import { RuntimeLog } from "./RuntimeLog"
@@ -104,7 +104,7 @@ export default function App() {
   const [initialSettings] = useState(() => {
     const defaults: PublicSettings = {
       baseUrl: defaultBase,
-      model: "qwen3.8-flash-next-aider",
+      model: "aider-omni-flash",
       temperatureThinking: 1.0,
       temperatureInstruct: 0.7,
       maxTokens: 32768,
@@ -200,6 +200,7 @@ export default function App() {
   const [loading, setLoading] = useState(false)
   const [tokenCount, setTokenCount] = useState(0)
   const [tokPerSec, setTokPerSec] = useState<number | null>(null)
+  const [tokPerSecAt, setTokPerSecAt] = useState<number | null>(null)
   const [ttft, setTtft] = useState<number | null>(null)
   /* P9 preparation UX: while a turn waits for its first token, poll the live
      prefill position so the wait is explained (unseen stable prefix vs prompt,
@@ -455,12 +456,21 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [servedByEngine, connected])
 
+  /* The speed meter shows API runs too: the gateway's token-weighted average of
+     its last API runs rides on the 5 s health poll (no extra request, nothing
+     per token on the gateway) and replaces the dashboard's own last run once an
+     API run finished after it. */
+  const apiSpeed = health?.api_decode
+  const apiSpeedAt = useMemo(() => (apiSpeed ? Date.now() - apiSpeed.age_seconds * 1000 : null), [apiSpeed])
+  const apiSpeedShown = apiSpeed && showApiSpeed(apiSpeedAt, tokPerSecAt) ? apiSpeed : null
+
   const canSend = useMemo(() => draft.trim() && model && !loading, [draft, loading, model])
 
   const clear = async () => {
     setError("")
     updateMessages([])
     setTokPerSec(null)
+    setTokPerSecAt(null)
     setTtft(null)
     setTokenCount(0)
     setTotalTokens({ prompt: 0, completion: 0 })
@@ -559,7 +569,7 @@ export default function App() {
           const finalRate = decodeTokensPerSecond(
             usageTotal.completion || count, firstTokenAt, performance.now(),
           )
-          if (finalRate !== null) setTokPerSec(finalRate)
+          if (finalRate !== null) { setTokPerSec(finalRate); setTokPerSecAt(Date.now()) }
           setTotalTokens(prev => ({ prompt: prev.prompt + usageTotal.prompt, completion: prev.completion + usageTotal.completion }))
           setLastRun(result)
           setConnected(true)
@@ -843,7 +853,8 @@ export default function App() {
           </div>
           <div className="top-actions">
               {loading && tokenCount > 0 ? <Badge className="badge-live"><Zap className="size-3 flash" /> {t("topbar.tokens", { n: tokenCount })}</Badge> : null}
-              {!loading && tokPerSec != null ? <Badge className="badge-speed"><Gauge className="size-3" /> {t("topbar.tokPerSec", { n: tokPerSec.toFixed(1) })}</Badge> : null}
+              {!loading && apiSpeedShown ? <Badge className="badge-speed" title={t("topbar.apiTokPerSecHelp", { runs: apiSpeedShown.runs, tokens: apiSpeedShown.tokens.toLocaleString() })}><Gauge className="size-3" /> {t("topbar.apiTokPerSec", { n: apiSpeedShown.tokens_per_second.toFixed(1) })}</Badge>
+                : !loading && tokPerSec != null ? <Badge className="badge-speed"><Gauge className="size-3" /> {t("topbar.tokPerSec", { n: tokPerSec.toFixed(1) })}</Badge> : null}
               {!loading && ttft != null ? <Badge><Timer className="size-3" /> TTFT {(ttft/1000).toFixed(1)}s</Badge> : null}
               {!loading && lastRun?.usage ? <Badge><Layers className="size-3" /> {lastRun.usage.prompt_tokens}→{lastRun.usage.completion_tokens}</Badge> : null}
               {!loading && lastRun?.finishReason === "length" ? <Badge className="badge-warn" title={t("topbar.truncatedHelp")}><AlertTriangle className="size-3" /> {t("topbar.truncated")}</Badge> : null}

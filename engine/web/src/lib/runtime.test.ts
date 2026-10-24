@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 
 import type { HealthResponse } from "./api"
-import { activeRequests, decodeTokensPerSecond, supportsCacheSlots } from "./runtime"
+import { activeRequests, decodeTokensPerSecond, showApiSpeed, supportsCacheSlots } from "./runtime"
 
 const healthWithActive = (active: boolean | number): HealthResponse => ({
   status: "ok",
@@ -21,6 +21,13 @@ const healthWithActive = (active: boolean | number): HealthResponse => ({
 describe("runtime capability normalization", () => {
   it("measures decode throughput from the first token, excluding prefill", () => {
     expect(decodeTokensPerSecond(101, 10_000, 20_000)).toBe(10)
+  })
+
+  it("shows the API speed only when an API run finished after the dashboard's own", () => {
+    expect(showApiSpeed(null, null)).toBe(false)
+    expect(showApiSpeed(5_000, null)).toBe(true)
+    expect(showApiSpeed(5_000, 9_000)).toBe(false)
+    expect(showApiSpeed(12_000, 9_000)).toBe(true)
   })
 
   it.each([

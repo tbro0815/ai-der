@@ -93,6 +93,8 @@ def parse_doc_rows(path):
     return rows, ordinal_less
 
 
+@unittest.skipUnless(os.path.isfile(FORMATS_MD),
+                     "docs/FORMATS.md is not in this tree (the public release export leaves upstream docs out)")
 class RegistryParityTest(unittest.TestCase):
     def setUp(self):
         self.c_names = parse_fmt_names(COLIBRI_C)

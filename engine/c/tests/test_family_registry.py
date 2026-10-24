@@ -913,6 +913,8 @@ class FamilyRegistryTest(unittest.TestCase):
 
     def test_build_install_ci_and_release_cover_registered_engines(self):
         repo = Path(__file__).resolve().parents[2]
+        if not (repo / ".github" / "workflows" / "ci.yml").is_file():
+            self.skipTest("upstream workflows are not in this tree (the public release export leaves them out)")
         makefile = (repo / "c" / "Makefile").read_text(encoding="utf-8")
         ci = (repo / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         release = (repo / ".github" / "workflows" / "release.yml").read_text(

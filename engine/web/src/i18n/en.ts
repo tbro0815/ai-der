@@ -118,6 +118,8 @@ const en: Record<string, string> = {
   "topbar.activeModel": "ACTIVE MODEL",
   "topbar.tokens": "{{n}} tokens",
   "topbar.tokPerSec": "{{n}} tok/s",
+  "topbar.apiTokPerSec": "API {{n}} tok/s",
+  "topbar.apiTokPerSecHelp": "Decode speed of the last {{runs}} API runs ({{tokens}} tokens), weighted by their tokens",
   "topbar.slot": "slot {{n}}",
   "topbar.truncated": "Truncated",
   "topbar.truncatedHelp": "The response hit the max output tokens limit and was cut off. Raise \"Max output tokens\" to see the full answer.",

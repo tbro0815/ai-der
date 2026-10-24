@@ -54,6 +54,11 @@ READY = b"\x01\x01READY\x01\x01\n"
 MAX_BODY = 24 << 20   # image turns: up to 32 data-URI images per request (the dashboard downsizes to ~1 MB each)
 PROFILE_TURNS = 120           # rolling window of per-turn PROF snapshots kept for /profile
 TELEMETRY_EVENTS = 240        # bounded live request log kept for /telemetry
+API_DECODE_RUNS = 8           # API runs the dashboard's speed meter averages (/health `api_decode`)
+API_DECODE_MIN_TOKENS = 16    # shorter runs (a lone tool call) say little about decode speed
+# which client sent the request this handler thread serves: "dashboard" (its chat
+# sends X-AI-DER-Client: dashboard) or "api"; unset on threads outside a request
+REQUEST_CLIENT = threading.local()
 MAX_SYSTEM_PROMPT = 65536
 DEFAULT_SYSTEM_PROMPT = """You are AI-DER a concise reasoning agent. When thinking (inside <think>…</think> blocks), you must use highly compressed, dense, and telegraphic logic.
 
@@ -3629,6 +3634,7 @@ class Engine:
         self.telemetry_seq = 0
         self.telemetry_lock = threading.Lock()
         self.telemetry_requests = {}
+        self.api_decode = collections.deque(maxlen=API_DECODE_RUNS)  # (tokens, decode seconds, time)
         self.runtime_lock = threading.Lock()
         self._cpu_sample = None
         self._gpu_sample = {}
@@ -3660,6 +3666,9 @@ class Engine:
             })
 
     def _register_telemetry_request(self, request_id, **fields):
+        client = getattr(REQUEST_CLIENT, "name", None)
+        if client:
+            fields["client"] = client
         with self.telemetry_lock:
             self.telemetry_requests[request_id] = dict(fields)
         self._record_telemetry("request_received", request_id, **fields)
@@ -3669,6 +3678,27 @@ class Engine:
             if remove:
                 return self.telemetry_requests.pop(request_id, {})
             return dict(self.telemetry_requests.get(request_id, {}))
+
+    def _meter_decode(self, meta, tokens, rate):
+        """Feed one finished API run to the dashboard's speed meter: one append at
+        the end of the run, nothing per token, so the API client pays nothing."""
+        if (meta.get("client") != "api" or tokens < API_DECODE_MIN_TOKENS
+                or not math.isfinite(rate) or rate <= 0):
+            return
+        with self.telemetry_lock:
+            self.api_decode.append((tokens, tokens / rate, time.time()))
+
+    def api_decode_meter(self):
+        """The speed meter's API figure: decode tok/s over the last API_DECODE_RUNS
+        API runs, weighted by their tokens (all tokens over all decode seconds),
+        so a long answer counts more than a short tool call; None before the first."""
+        with self.telemetry_lock:
+            runs = list(self.api_decode)
+        if not runs:
+            return None
+        tokens = sum(run[0] for run in runs)
+        return {"tokens_per_second": tokens / sum(run[1] for run in runs), "runs": len(runs),
+                "tokens": tokens, "age_seconds": max(time.time() - runs[-1][2], 0.0)}
 
     @staticmethod
     def _host_cpu_times():
@@ -3876,6 +3906,7 @@ class Engine:
                     stats["cached_tokens"] = (self._prefill_cached.pop(request_id, None)
                                               or stats["restored_tokens"] or 0)
                     meta = self._telemetry_request(request_id, remove=True)
+                    self._meter_decode(meta, stats["completion_tokens"], stats["tokens_per_second"])
                     self._record_telemetry(
                         "generation_finished", request_id,
                         completion_tokens=stats["completion_tokens"],
@@ -5276,6 +5307,7 @@ class ProxyEngine(Engine):
                  "cached_tokens": min(int(cached or 0), prompt_tokens),
                  "length_limited": last["finish_reason"] == "length" and not last["stop"]}
         meta = self._telemetry_request(request_id, remove=True)
+        self._meter_decode(meta, completion_tokens, rate)
         self._record_telemetry("generation_finished", request_id,
                                completion_tokens=completion_tokens, tokens_per_second=rate,
                                expert_cache_hit_percent=0.0, rss_gb=0.0,
@@ -6084,7 +6116,7 @@ class APIHandler(BaseHTTPRequestHandler):
             return
         self.send_header("Access-Control-Allow-Origin", "*" if "*" in self.server.cors_origins else origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, x-api-key, anthropic-version")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, x-api-key, anthropic-version, X-AI-DER-Client")
         self.send_header("Access-Control-Expose-Headers",
                          "x-request-id, x-colibri-queue-wait-ms, Retry-After")
         self.send_header("Access-Control-Max-Age", "600")
@@ -6280,6 +6312,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     if progress: payload["progress"] = progress
                     backend = getattr(self.server.engine, "backend", None) if self.server.engine else None
                     if backend: payload["backend"] = backend
+                    meter = getattr(self.server.engine, "api_decode_meter", None) if self.server.engine else None
+                    meter = meter() if meter else None
+                    if meter: payload["api_decode"] = meter
                 self.send_json(200 if healthy else 503, payload, request_id)
                 return
             if path == "/experts":
@@ -6426,6 +6461,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         request_id = "req_" + uuid.uuid4().hex
+        REQUEST_CLIENT.name = "dashboard" if self.headers.get("X-AI-DER-Client") == "dashboard" else "api"
         try:
             self._check_host()
             self.require_auth()

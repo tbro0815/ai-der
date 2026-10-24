@@ -20,7 +20,7 @@ import openai_server
 from openai_server import (saved_vllm_variant, saved_variant, _coerce_arg, ProxyImages, collect_proxy_images, proxy_chat_messages, anthropic_to_openai, _native_tool_call, APIError, APIHandler, APIServer, ClientCancelled, ProxyEngine,
                            backend_model_id, resolve_backend, saved_backend, saved_context_profile,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
-                           READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
+                           READY, REQUEST_CLIENT, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
                            _engine_error, cap_for_arch, conversation_cache_slot, model_arch,
                            generation_options, parse_tool_calls, parse_dsv4_tool_calls,
                            parse_arch_tool_calls, parse_k3_tool_calls,
@@ -1145,6 +1145,37 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(snapshot["events"][3]["tokens_per_second"], 8.0)
         self.assertEqual(snapshot["events"][3]["expert_cache_hit_percent"], 92.5)
 
+    def test_speed_meter_averages_api_runs_by_their_tokens(self):
+        # tokens and tok/s per run: two API runs, the dashboard's, a 4-token API run
+        runs = iter([b"40 20.000", b"40 10.000", b"40 99.000", b"4 1.000"])
+
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"ACCEPT " + request_id + b" 12\n")
+            process.stdout.feed(b"DATA " + request_id + b" 2\nok\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT " + next(runs) + b" 92.5 3.25 12 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        self.addCleanup(engine.close)
+        engine.context_window = 128
+        self.assertIsNone(engine.api_decode_meter())
+        try:
+            for client in ("api", "api", "dashboard", "api"):
+                REQUEST_CLIENT.name = client
+                engine.generate("hello", 64, 0.7, 0.9, lambda _: None, cache_slot=0)
+        finally:
+            del REQUEST_CLIENT.name
+        meter = engine.api_decode_meter()
+        # 80 tokens in 2 s + 4 s of decode; the dashboard's run and the 4-token run are left out
+        self.assertAlmostEqual(meter["tokens_per_second"], 80 / 6)
+        self.assertEqual((meter["runs"], meter["tokens"]), (2, 80))
+        self.assertLess(meter["age_seconds"], 5)
+        received = [e["client"] for e in engine.telemetry_snapshot()["events"]
+                    if e["event"] == "request_received"]
+        self.assertEqual(received, ["api", "api", "dashboard", "api"])
+
     def test_accepts_u7a_echo_and_extended_data_frames(self):
         # U7a forward-compat: the engine's opt-in per-token numeric channel --
         # ECHO frames for echoed prompt positions and DATA frames extended
@@ -1616,6 +1647,31 @@ class HTTPTest(unittest.TestCase):
         self.assertEqual(scheduler["max_queue"], 8)
         self.assertIn("queued", scheduler)
         self.assertEqual(health["kv_slots"], 2)
+
+    def test_chat_requests_are_tagged_by_client_for_the_speed_meter(self):
+        seen = []
+        generate = self.engine.generate
+
+        def tagged(*args, **kwargs):
+            seen.append(REQUEST_CLIENT.name)
+            return generate(*args, **kwargs)
+
+        body = {"model": "test-model", "max_tokens": 4, "messages": [{"role": "user", "content": "Hi"}]}
+        dashboard = {"Authorization": "Bearer secret", "Content-Type": "application/json",
+                     "X-AI-DER-Client": "dashboard"}
+        with patch.object(self.engine, "generate", tagged):
+            with self.request("/v1/chat/completions", body):
+                pass
+            with urlopen(Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                 headers=dashboard), timeout=2):
+                pass
+        self.assertEqual(seen, ["api", "dashboard"])
+        meter = {"tokens_per_second": 12.5, "runs": 3, "tokens": 900, "age_seconds": 4.0}
+        with patch.object(self.engine, "api_decode_meter", lambda: meter, create=True):
+            with self.request("/health") as response:
+                self.assertEqual(json.load(response)["api_decode"], meter)
+        with self.request("/health") as response:
+            self.assertNotIn("api_decode", json.load(response))
 
     def test_health_rejects_a_dead_engine(self):
         engine = self.server.engine
@@ -3760,7 +3816,7 @@ class ProxyEngineTest(unittest.TestCase):
         env = {"COLI_VLLM_CMD": "/bin/bash /srv/start_qwen.sh", "COLI_VLLM_MODEL": "/srv/models/q27",
                "COLI_VLLM_PORT": str(self.upstream.server_address[1]), "COLI_VLLM_PREFIXES": self.slots.name}
         with patch("openai_server.ARCH", "qwen38"):
-            engine = ProxyEngine("vllm", "qwen3.8-flash-next-aider", env=env, spawn=False)
+            engine = ProxyEngine("vllm", "aider-omni-flash", env=env, spawn=False)
         engine.process = FakeProcess(lambda *_: None)
         prompt = "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>"
         engine.generate(prompt, 64, 0.0, 0.9, [].append, reasoning_budget=8)
@@ -3818,10 +3874,10 @@ class ProxyEngineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             env = self._strata_env(tmp)
             with patch("openai_server.ARCH", "qwen38"):
-                standard = ProxyEngine("strata", "qwen3.8-flash-next-aider", env=env, spawn=False)
-                long = ProxyEngine("strata", "qwen3.8-flash-next-aider",
+                standard = ProxyEngine("strata", "aider-omni-flash", env=env, spawn=False)
+                long = ProxyEngine("strata", "aider-omni-flash",
                                    env=dict(env, COLI_CONTEXT_PROFILE="long", COLI_STRATA_VARIANT="ud"), spawn=False)
-                fast = ProxyEngine("strata", "qwen3.8-flash-next-aider",
+                fast = ProxyEngine("strata", "aider-omni-flash",
                                    env=dict(env, COLI_CONTEXT_PROFILE="fast"), spawn=False)
             for engine, variant, window in ((standard, "gsq", 131072), (long, "ud", 262144), (fast, "gsq", 131072)):
                 self.assertEqual((engine.backend["variant"], engine.context_window, engine.backend["context_window"]),
@@ -3851,7 +3907,7 @@ class ProxyEngineTest(unittest.TestCase):
             "chat_deltas": [{"reasoning_content": "think "}, {"content": "Answer."}], "chat_finish": "stop"}
         with tempfile.TemporaryDirectory() as tmp:
             with patch("openai_server.ARCH", "qwen38"):
-                engine = ProxyEngine("strata", "qwen3.8-flash-next-aider", env=self._strata_env(tmp), spawn=False)
+                engine = ProxyEngine("strata", "aider-omni-flash", env=self._strata_env(tmp), spawn=False)
             engine.process = FakeProcess(lambda *_: None)
             messages, image = engine.prepare_images(
                 [{"role": "system", "content": "s"}, {"role": "user", "content": "q"}], None, None, True, "xhigh")
@@ -3898,13 +3954,13 @@ class ProxyEngineTest(unittest.TestCase):
             self.assertIn("maya", openai_server.available_backends(env))
             self.assertIn("maya", openai_server.profile_backends("long", env))
             with patch("openai_server.ARCH", "qwen38"):
-                glm = ProxyEngine("maya", "qwen3.8-flash-next-aider",
+                glm = ProxyEngine("maya", "aider-omni-flash",
                                   env=dict(env, COLI_CONTEXT_PROFILE="long"), spawn=False)
-                ds4 = ProxyEngine("maya", "qwen3.8-flash-next-aider",
+                ds4 = ProxyEngine("maya", "aider-omni-flash",
                                   env=dict(env, COLI_CONTEXT_PROFILE="long", COLI_MAYA_VARIANT="ds4-s"), spawn=False)
-                fast = ProxyEngine("maya", "qwen3.8-flash-next-aider",
+                fast = ProxyEngine("maya", "aider-omni-flash",
                                    env=dict(env, COLI_CONTEXT_PROFILE="fast"), spawn=False)
-                ds4v = ProxyEngine("maya", "qwen3.8-flash-next-aider",
+                ds4v = ProxyEngine("maya", "aider-omni-flash",
                                    env=dict(env, COLI_MAYA_VARIANT="ds4-v"), spawn=False)
             for engine, variant, window, images in ((glm, "glm-s24", 262144, True), (ds4, "ds4-s", 131072, False),
                                                     (fast, "glm-s24", 131072, True), (ds4v, "ds4-v", 131072, True)):
@@ -3927,7 +3983,7 @@ class ProxyEngineTest(unittest.TestCase):
             # the port defaults to Maya's own, beside Strata's 8084
             env.pop("COLI_MAYA_PORT")
             with patch("openai_server.ARCH", "qwen38"):
-                engine = ProxyEngine("maya", "qwen3.8-flash-next-aider", env=env, spawn=False)
+                engine = ProxyEngine("maya", "aider-omni-flash", env=env, spawn=False)
             self.assertEqual(engine.port, 8085)
             engine.close()
 
@@ -3939,7 +3995,7 @@ class ProxyEngineTest(unittest.TestCase):
             "chat_finish": "tool_calls"}
         with tempfile.TemporaryDirectory() as tmp:
             with patch("openai_server.ARCH", "qwen38"):
-                engine = ProxyEngine("maya", "qwen3.8-flash-next-aider", env=self._maya_env(tmp), spawn=False)
+                engine = ProxyEngine("maya", "aider-omni-flash", env=self._maya_env(tmp), spawn=False)
             engine.process = FakeProcess(lambda *_: None)
             tools = [{"type": "function", "function": {"name": "note", "parameters": {"type": "object"}}}]
             _, image = engine.prepare_images([{"role": "user", "content": "q"}], tools, "auto", True, "xhigh")
@@ -3973,7 +4029,7 @@ class ProxyEngineTest(unittest.TestCase):
                "COLI_VLLM_PORT": str(self.upstream.server_address[1]), "COLI_VLLM_PREFIXES": self.slots.name,
                "COLI_VLLM_ENV": "PORT=8082 VISION=1", "COLI_VLLM_IMAGES": "2"}
         with patch("openai_server.ARCH", "qwen38"):
-            engine = ProxyEngine("vllm", "qwen3.8-flash-next-aider", env=env, spawn=False)
+            engine = ProxyEngine("vllm", "aider-omni-flash", env=env, spawn=False)
         engine.process = FakeProcess(lambda *_: None)
         self.assertTrue(engine.images)
         tools = [{"type": "function", "function": {"name": "note", "parameters": {
@@ -4027,9 +4083,9 @@ class BackendSelectionTest(unittest.TestCase):
         self.assertEqual(resolve_backend("colibri", None, env), "aider")   # pre-rename alias
         with self.assertRaises(ValueError):
             resolve_backend("other", None, env)
-        self.assertEqual(backend_model_id("llamacpp", "qwen3.8-flash-next-aider", env),
-                         "qwen3.8-flash-next-aider")
-        self.assertEqual(backend_model_id("vllm", "qwen3.8-flash-next-aider", env), "qwen3.8-flash-next-aider")
+        self.assertEqual(backend_model_id("llamacpp", "aider-omni-flash", env),
+                         "aider-omni-flash")
+        self.assertEqual(backend_model_id("vllm", "aider-omni-flash", env), "aider-omni-flash")
 
     def test_vllm_prefix_text_is_stored_and_warmed_after_a_start(self):
         upstream = ThreadingHTTPServer(("127.0.0.1", 0), _UpstreamHandler)
@@ -4044,7 +4100,7 @@ class BackendSelectionTest(unittest.TestCase):
                 prompt = ("<|im_start|>system\nYou are a long system block.<|im_end|>\n"
                           "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n")
                 with patch("openai_server.ARCH", "qwen38"):
-                    engine = ProxyEngine("vllm", "qwen3.8-flash-next-aider", env=env, spawn=False)
+                    engine = ProxyEngine("vllm", "aider-omni-flash", env=env, spawn=False)
                 engine.process = FakeProcess(lambda *_: None)
                 engine.generate(prompt, 8, 0.0, 0.9, lambda _: None)
                 stored = list(Path(tmp).glob("prefix-*.txt"))
@@ -4057,14 +4113,14 @@ class BackendSelectionTest(unittest.TestCase):
                 # a fresh engine (restart) replays the stored prefix before serving
                 _UpstreamHandler.seen = []
                 with patch("openai_server.ARCH", "qwen38"):
-                    second = ProxyEngine("vllm", "qwen3.8-flash-next-aider", env=env, spawn=False)
+                    second = ProxyEngine("vllm", "aider-omni-flash", env=env, spawn=False)
                 self.assertEqual(second.warm_prefixes(), 1)
                 self.assertEqual(_UpstreamHandler.seen[0][1]["prompt"], stored[0].read_text())
                 self.assertEqual(_UpstreamHandler.seen[0][1]["max_tokens"], 1)
                 # cache reset on vLLM: the dev-mode endpoint plus the stored prefix texts
                 self.assertFalse(second.supports_cache_reset)         # no VLLM_SERVER_DEV_MODE in env
                 with patch("openai_server.ARCH", "qwen38"):
-                    third = ProxyEngine("vllm", "qwen3.8-flash-next-aider",
+                    third = ProxyEngine("vllm", "aider-omni-flash",
                                         env=dict(env, COLI_VLLM_ENV="VLLM_SERVER_DEV_MODE=1"), spawn=False)
                 self.assertTrue(third.supports_cache_reset)
                 _UpstreamHandler.seen = []
@@ -4081,11 +4137,11 @@ class BackendSelectionTest(unittest.TestCase):
                "COLI_VLLM_ENV": "PORT=8082 HOST=127.0.0.1 CTX=fast PREFIX_CACHE=1",
                "COLI_VLLM_CONTEXT": "65536"}
         with patch("openai_server.ARCH", "qwen38"):
-            engine = ProxyEngine("vllm", "qwen3.8-flash-next-aider", env=env, spawn=False)
+            engine = ProxyEngine("vllm", "aider-omni-flash", env=env, spawn=False)
         self.assertEqual(engine.command, ["/bin/bash", "/srv/start_qwen.sh"])
-        self.assertEqual(engine.model_id, "qwen3.8-flash-next-aider")   # public id, spoofed
+        self.assertEqual(engine.model_id, "aider-omni-flash")   # public id, spoofed
         with patch("openai_server.ARCH", "qwen38"):
-            poisoned = ProxyEngine("vllm", "qwen3.8-flash-next-aider",
+            poisoned = ProxyEngine("vllm", "aider-omni-flash",
                                    env=dict(env, PYTHONPATH="/venvs/hf/lib/python3.14/site-packages"), spawn=False)
         self.assertNotIn("PYTHONPATH", poisoned.child_env)
         poisoned.close()
@@ -4100,10 +4156,10 @@ class BackendSelectionTest(unittest.TestCase):
                "COLI_VLLM_ENV": "PORT=8082 HOST=127.0.0.1 CTX=long MAX_LEN=131072 PREFIX_CACHE=1",
                "COLI_VLLM_CONTEXT": "131072"}
         with patch("openai_server.ARCH", "qwen38"):
-            standard = ProxyEngine("vllm", "qwen3.8-flash-next-aider", env=env, spawn=False)
-            fast = ProxyEngine("vllm", "qwen3.8-flash-next-aider",
+            standard = ProxyEngine("vllm", "aider-omni-flash", env=env, spawn=False)
+            fast = ProxyEngine("vllm", "aider-omni-flash",
                                env=dict(env, COLI_CONTEXT_PROFILE="fast"), spawn=False)
-            legacy = ProxyEngine("vllm", "qwen3.8-flash-next-aider",
+            legacy = ProxyEngine("vllm", "aider-omni-flash",
                                  env=dict(env, COLI_VLLM_PROFILE="long"), spawn=False)
         self.assertEqual((standard.child_env["CTX"], standard.context_window, standard.backend["profile"]),
                          ("long", 131072, "standard"))
@@ -4111,7 +4167,7 @@ class BackendSelectionTest(unittest.TestCase):
                           fast.backend["profile"]), ("fast", "81920", 81920, "fast"))
         self.assertEqual((legacy.context_window, legacy.backend["profile"]), (131072, "standard"))
         with patch("openai_server.ARCH", "qwen38"):
-            wide = ProxyEngine("vllm", "qwen3.8-flash-next-aider",
+            wide = ProxyEngine("vllm", "aider-omni-flash",
                                env=dict(env, COLI_CONTEXT_PROFILE="vllm-190k"), spawn=False)
         # the standard fp8 launch with the larger MAX_LEN
         self.assertEqual((wide.child_env["CTX"], wide.child_env["MAX_LEN"], wide.context_window,
@@ -4122,8 +4178,8 @@ class BackendSelectionTest(unittest.TestCase):
         lenv = {"COLI_LLAMACPP_MODEL": "/models/x.gguf", "COLI_LLAMACPP_PORT": "18081",
                 "COLI_LLAMACPP_ARGS": "-c 131072 -fa on --fit-target 256"}
         with patch("openai_server.ARCH", "qwen38"):
-            plain = ProxyEngine("llamacpp", "qwen3.8-flash-next-aider", env=lenv, spawn=False)
-            long = ProxyEngine("llamacpp", "qwen3.8-flash-next-aider",
+            plain = ProxyEngine("llamacpp", "aider-omni-flash", env=lenv, spawn=False)
+            long = ProxyEngine("llamacpp", "aider-omni-flash",
                                env=dict(lenv, COLI_CONTEXT_PROFILE="long"), spawn=False)
         self.assertEqual((plain.context_window, plain.backend["profile"]), (131072, "standard"))
         self.assertEqual((long.context_window, long.backend["profile"]), (262144, "long"))
@@ -4143,17 +4199,17 @@ class BackendSelectionTest(unittest.TestCase):
             env = {"COLI_VLLM_CMD": "/bin/bash /srv/start_qwen.sh", "COLI_VLLM_MODEL": "/srv/models/q27",
                    "COLI_VLLM_ENV": "PORT=8082 CTX=long MAX_LEN=131072", "COLI_VLLM_VARIANTS": catalog}
             with patch("openai_server.ARCH", "qwen38"):
-                default = ProxyEngine("vllm", "qwen3.8-flash-next-aider", env=env, spawn=False)
-                chosen = ProxyEngine("vllm", "qwen3.8-flash-next-aider",
+                default = ProxyEngine("vllm", "aider-omni-flash", env=env, spawn=False)
+                chosen = ProxyEngine("vllm", "aider-omni-flash",
                                      env=dict(env, COLI_VLLM_VARIANT="fable"), spawn=False)
             self.assertEqual((default.child_env["MODEL"], default.backend["variant"], default.backend["model"]),
                              (str(base), "base", "Qwen3.8-27B-base"))
             self.assertEqual((chosen.child_env["MODEL"], chosen.backend["variant"]), (str(fable), "fable"))
             # the variant's cap: 190K asked, 167,936 served and advertised; below the cap unchanged
             with patch("openai_server.ARCH", "qwen38"):
-                wide = ProxyEngine("vllm", "qwen3.8-flash-next-aider",
+                wide = ProxyEngine("vllm", "aider-omni-flash",
                                    env=dict(env, COLI_VLLM_VARIANT="fable", COLI_CONTEXT_PROFILE="vllm-190k"), spawn=False)
-                narrow = ProxyEngine("vllm", "qwen3.8-flash-next-aider",
+                narrow = ProxyEngine("vllm", "aider-omni-flash",
                                      env=dict(env, COLI_VLLM_VARIANT="fable", COLI_CONTEXT_PROFILE="standard"), spawn=False)
             self.assertEqual((wide.context_window, wide.child_env["MAX_LEN"], wide.backend["context_window"]),
                              (167936, "167936", 167936))

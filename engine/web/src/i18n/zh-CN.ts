@@ -50,6 +50,8 @@ const zhCN: Record<string, string> = {
   "topbar.activeModel": "当前模型",
   "topbar.tokens": "{{n}} tokens",
   "topbar.tokPerSec": "{{n}} tok/s",
+  "topbar.apiTokPerSec": "API {{n}} tok/s",
+  "topbar.apiTokPerSecHelp": "最近 {{runs}} 次 API 运行的解码速度（{{tokens}} token），按 token 数加权",
   "topbar.slot": "槽位 {{n}}",
   "topbar.truncated": "已截断",
   "topbar.truncatedHelp": "回复达到最大输出 token 上限而被截断。请调高“最大输出 token 数”以查看完整回答。",

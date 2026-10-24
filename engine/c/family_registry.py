@@ -776,8 +776,10 @@ FAMILIES = (
         # the qwen38 family descriptor), a format stock colibri cannot read
         # and which no stock colibri build produces. Advertising it as
         # "qwen3.8-colibri" would promise interchangeability that does not
-        # exist, so the served id names the model and the runner instead.
-        default_model_id="qwen3.8-flash-next-aider",
+        # exist. Every backend serves this id (Qwen3.8, GLM-5.3 and
+        # DeepSeek-V4.1 models behind the one gateway), so it names the
+        # runner, not a model.
+        default_model_id="aider-omni-flash",
         cli_adapter="qwen38",
         gateway_adapter="qwen38",
         planner_id="qwen38_hybrid",

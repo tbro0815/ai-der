@@ -22,8 +22,15 @@ class SegmentConformanceManifestTest(unittest.TestCase):
         self.assertEqual(
             self.manifest["release_policy"], "all_registered_families")
         manifest_ids = [entry["family_id"] for entry in self.entries]
-        registry_ids = [family.id for family in FAMILIES]
+        # a registered family outside the Segment runtime is named, with its
+        # reason, instead of silently dropped from the gate
+        exempt = self.manifest.get("exempt_families", {})
+        for family_id, reason in exempt.items():
+            self.assertTrue(reason.strip(), family_id)
+            self.assertNotIn(family_id, manifest_ids)
+        registry_ids = [family.id for family in FAMILIES if family.id not in exempt]
         self.assertEqual(manifest_ids, registry_ids)
+        self.assertEqual(set(exempt) - {family.id for family in FAMILIES}, set())
         self.assertEqual(len(manifest_ids), len(set(manifest_ids)))
 
     def test_every_entry_is_an_honest_contract_fixture(self):

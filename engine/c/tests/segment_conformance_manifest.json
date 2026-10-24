@@ -1,6 +1,9 @@
 {
   "version": 1,
   "release_policy": "all_registered_families",
+  "exempt_families": {
+    "qwen38": "AI-DER's own engine (qwen38.c), run standalone by the gateway: no Segment adapter, not a Colibri family"
+  },
   "families": [
     {
       "family_id": "glm53",

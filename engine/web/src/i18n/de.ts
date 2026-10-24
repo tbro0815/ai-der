@@ -79,6 +79,8 @@ const de: Record<string, string> = {
   "topbar.activeModel": "AKTIVES MODELL",
   "topbar.tokens": "{{n}} Tokens",
   "topbar.tokPerSec": "{{n}} Tok/s",
+  "topbar.apiTokPerSec": "API {{n}} Tok/s",
+  "topbar.apiTokPerSecHelp": "Decode-Geschwindigkeit der letzten {{runs}} API-Läufe ({{tokens}} Tokens), nach Tokens gewichtet",
   "topbar.slot": "Slot {{n}}",
   "topbar.truncated": "Abgeschnitten",
   "topbar.truncatedHelp": "Die Antwort erreichte die maximale Tokenanzahl und wurde abgeschnitten. Erhöhe \"Maximale Ausgabetokens\", um die vollständige Antwort zu sehen.",

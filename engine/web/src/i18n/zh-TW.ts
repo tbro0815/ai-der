@@ -50,6 +50,8 @@ const zhTW: Record<string, string> = {
   "topbar.activeModel": "目前模型",
   "topbar.tokens": "{{n}} tokens",
   "topbar.tokPerSec": "{{n}} tok/s",
+  "topbar.apiTokPerSec": "API {{n}} tok/s",
+  "topbar.apiTokPerSecHelp": "最近 {{runs}} 次 API 執行的解碼速度（{{tokens}} token），依 token 數加權",
   "topbar.slot": "插槽 {{n}}",
   "topbar.truncated": "已截斷",
   "topbar.truncatedHelp": "回應達到最大輸出 token 上限而被截斷。請提高「最大輸出 token 數」以查看完整答案。",

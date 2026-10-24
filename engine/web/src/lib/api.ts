@@ -101,6 +101,17 @@ export interface HealthResponse {
   progress?: PrefillProgress
   /** the inference backend serving this gateway (colibri, llama.cpp, vLLM) */
   backend?: BackendHealth
+  /** the speed meter's API figure: decode tok/s of the last API runs (not the
+   *  dashboard's), weighted by their tokens; absent before the first */
+  api_decode?: ApiDecodeMeter
+}
+
+export interface ApiDecodeMeter {
+  tokens_per_second: number
+  runs: number
+  tokens: number
+  /** seconds since the last of these runs finished */
+  age_seconds: number
 }
 
 export interface PrefillProgress {
@@ -452,7 +463,8 @@ export interface StreamChatOptions {
 export async function streamChat(options: StreamChatOptions): Promise<StreamChatResult> {
   const response = await fetch(endpoint(options.baseUrl, "chat/completions"), {
     method: "POST",
-    headers: headers(options.apiKey),
+    /* the gateway leaves the dashboard's own runs out of its API speed meter */
+    headers: { ...headers(options.apiKey), "X-AI-DER-Client": "dashboard" },
     signal: options.signal,
     body: JSON.stringify({
       model: options.model,

@@ -152,8 +152,10 @@ class MessagesHTTPTest(unittest.TestCase):
         self.assertEqual(payload["content"], [{"type": "text", "text": "Héllo"}])
         self.assertEqual(payload["stop_reason"], "end_turn")
         self.assertIsNone(payload["stop_sequence"])
-        # Anthropic's usage field names, not OpenAI's prompt_tokens/completion_tokens
-        self.assertEqual(payload["usage"], {"input_tokens": 11, "output_tokens": 3})
+        # Anthropic's usage field names, not OpenAI's prompt_tokens/completion_tokens,
+        # with the cache reads apart from the fresh input (nothing cached here)
+        self.assertEqual(payload["usage"], {"input_tokens": 11, "cache_creation_input_tokens": 0,
+                                            "cache_read_input_tokens": 0, "output_tokens": 3})
         self.assertTrue(payload["id"].startswith("msg_"))
 
     def test_each_architecture_receives_its_native_chat_prompt(self):
