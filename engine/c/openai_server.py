@@ -4753,6 +4753,13 @@ class ProxyEngine(Engine):
         self.stall_idle = float(environ.get("COLI_STALL_IDLE", "180"))
         self.stall_rate = float(environ.get("COLI_STALL_PREFILL_RATE",
                                             str(self.STALL_PREFILL_RATE.get(backend, 100))))
+        # Strata / Maya stream nothing while they write a tool call's arguments
+        # (DeepSeek's DSML values come out whole at their closing tag: a 5,700-token
+        # `ipython` call was 6 minutes of silence).  A silent stream whose server
+        # still counts generated tokens (its /status) waits on, looked at again every
+        # COLI_STALL_RECHECK seconds, up to COLI_STALL_PROGRESS_MAX seconds of silence.
+        self.stall_recheck = float(environ.get("COLI_STALL_RECHECK", "30"))
+        self.stall_progress_max = float(environ.get("COLI_STALL_PROGRESS_MAX", "1800"))
         self.start_timeout = float(environ.get("COLI_BACKEND_START_TIMEOUT", "900"))
         self.ready = threading.Event()        # cleared while the upstream restarts
         self.ready.set()
@@ -4851,6 +4858,25 @@ class ProxyEngine(Engine):
     def stall_deadline(self, prompt_tokens):
         """Seconds allowed before the first streamed token."""
         return self.stall_base + max(int(prompt_tokens or 0), 0) / max(self.stall_rate, 1.0)
+
+    def _upstream_generated(self):
+        """Strata / Maya: the running request's generated-token count from the
+        server's /status, else None (another backend, idle, unreachable)."""
+        if self.backend_id not in CHAT_BACKENDS:
+            return None
+        conn = http.client.HTTPConnection(self.host, self.port, timeout=2.0)
+        try:
+            conn.request("GET", "/status")
+            response = conn.getresponse()
+            status = json.loads(response.read()) if response.status == 200 else None
+        except (OSError, ValueError, http.client.HTTPException):
+            return None
+        finally:
+            conn.close()
+        if not isinstance(status, dict) or not status.get("busy"):
+            return None
+        generated = status.get("generated")
+        return generated if isinstance(generated, int) and not isinstance(generated, bool) else None
 
     def _wait_ready(self, timeout):
         deadline = time.monotonic() + timeout
@@ -5479,8 +5505,9 @@ class ProxyEngine(Engine):
         cancel = stop = accepted = False
         reported = 0              # completion tokens already passed to on_tokens
         guard = self.stall_base > 0
-        last_progress = time.monotonic()
+        last_progress = silent_since = time.monotonic()
         limit = self.stall_deadline(prompt_tokens)
+        generated = None          # the server's own token count at the last silent check
         stall = None
         try:
             while True:
@@ -5491,10 +5518,26 @@ class ProxyEngine(Engine):
                         cancel = True
                         break
                     if guard and time.monotonic() - last_progress > limit:
-                        waited = time.monotonic() - last_progress
+                        waited = time.monotonic() - silent_since
+                        if waited < self.stall_progress_max:
+                            count = self._upstream_generated()
+                            if count is not None and count != generated:
+                                if generated is None:
+                                    print(f"[stall] {self.backend['label']}: no output for {waited:.0f} s, "
+                                          f"but it generates ({count} tokens): waiting, up to "
+                                          f"{self.stall_progress_max:.0f} s", file=sys.stderr)
+                                generated = count
+                                last_progress, limit = time.monotonic(), self.stall_recheck
+                                continue
+                        if generated is None:
+                            why = f"limit {limit:.0f} s"
+                        elif waited < self.stall_progress_max:
+                            why = f"its token count stopped at {generated}"
+                        else:
+                            why = f"ceiling {self.stall_progress_max:.0f} s while it generates"
                         stall = UpstreamStalled(
                             f"no {'first token' if first_token_at is None else 'output'} for "
-                            f"{waited:.0f} s (limit {limit:.0f} s, ~{int(prompt_tokens or 0)} prompt tokens)")
+                            f"{waited:.0f} s ({why}, ~{int(prompt_tokens or 0)} prompt tokens)")
                         break
                     continue
                 if kind == "accept":
@@ -5510,8 +5553,9 @@ class ProxyEngine(Engine):
                         # error event; ignored, the reply ended as an empty normal stop
                         message = error.get("message") if isinstance(error, dict) else str(error)
                         raise RuntimeError(f"backend error in stream: {message or 'no detail'}")
-                    last_progress = time.monotonic()
+                    last_progress = silent_since = time.monotonic()
                     limit = self.stall_idle
+                    generated = None
                     if on_accept is not None:
                         on_accept({"prompt_tokens": None})
                         on_accept = None

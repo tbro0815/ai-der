@@ -3276,6 +3276,11 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path == "/status" and "upstream_status" in type(self).script:   # Strata / Maya
+            payload = json.dumps(type(self).script["upstream_status"]).encode()
+            self.send_response(200); self.send_header("Content-Length", str(len(payload))); self.end_headers()
+            self.wfile.write(payload)
+            return
         self.send_response(200); self.send_header("Content-Length", "2"); self.end_headers()
         self.wfile.write(b"ok")
 
@@ -3600,6 +3605,43 @@ class ProxyEngineTest(unittest.TestCase):
         engine = self.engine()
         self.assertEqual(engine.stall_deadline(0), 180.0)
         self.assertEqual(engine.stall_deadline(100_000), 180.0 + 100_000 / 100)
+        engine.close()
+
+    def test_silent_stream_waits_while_the_server_generates(self):
+        # a tool call written without streaming: 1.5 s of silence after the first chunk
+        _UpstreamHandler.script = {"status": 200, "chunks": ("Hé", "llo"), "prompt_tokens": 7,
+                                   "hang": 1.5, "hang_after": 1}
+        counts = iter(range(100, 10_000, 15))
+        for upstream, progress_max, stalls in ((lambda: next(counts), 30.0, 0),   # count moves: waits it out
+                                               (lambda: 100, 30.0, 1),            # count stuck: a stall
+                                               (lambda: None, 30.0, 1),           # no status: a stall
+                                               (lambda: next(counts), 0.7, 1)):   # past the ceiling: a stall
+            engine = self.engine()
+            engine.stall_base, engine.stall_idle, engine.stall_rate = 0.3, 0.3, 1e9
+            engine.stall_recheck, engine.stall_progress_max = 0.2, progress_max
+            out = []
+            with patch.object(engine, "restart_upstream") as restart, \
+                    patch.object(engine, "_upstream_generated", upstream):
+                if stalls:
+                    with self.assertRaises(APIError) as caught:
+                        engine.generate("Hi", 8, 0.0, 0.9, out.append)
+                    self.assertEqual(caught.exception.code, "backend_stalled")
+                else:
+                    engine.generate("Hi", 8, 0.0, 0.9, out.append)
+            self.assertEqual((restart.call_count, engine.stalls), (stalls, stalls))
+            self.assertEqual(out, ["Hé"])
+            engine.close()
+
+    def test_upstream_generated_reads_the_status_of_strata_and_maya(self):
+        engine = self.engine()
+        _UpstreamHandler.script = {"upstream_status": {"busy": True, "generated": 4475, "phase": "writing a tool call"}}
+        self.assertIsNone(engine._upstream_generated())               # llama.cpp has no such counter
+        with patch.object(engine, "backend_id", "maya"):
+            self.assertEqual(engine._upstream_generated(), 4475)
+            _UpstreamHandler.script = {"upstream_status": {"busy": False, "queued": 0}}
+            self.assertIsNone(engine._upstream_generated())
+            _UpstreamHandler.script = {}                                # "ok", not JSON
+            self.assertIsNone(engine._upstream_generated())
         engine.close()
 
     def test_error_event_in_the_stream_fails_the_request(self):
