@@ -1,12 +1,12 @@
 # AI-DER 1.5.2
 
 **Artificial Intelligence Distributed Engram Runner** is a local inference runner
-for Qwen3.8-Flash-Next quantized mixture-of-experts models. It combines SSD-backed
+for large quantized mixture-of-experts models. It combines SSD-backed
 weights, RAM caching and CUDA GPU tiers, with expert-prefetch experiments,
 an OpenAI-compatible API and a browser dashboard with chat.
 
-AI-DER is based on [colibrì](https://github.com/JustVugg/colibri), with a custom
-Qwen3.8 engine, container converter, GPU routing and inference kernels.
+AI-DER combines a custom
+Qwen3.8 engine, container converter, GPU routing and various inference kernels.
 
 ![The AI-DER dashboard: runtime and inference settings, live engine log](engine/web/screenshots/dashboard.webp)
 
