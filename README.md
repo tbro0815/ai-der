@@ -39,7 +39,7 @@ the dashboard and take effect at the next restart.
 | llama.cpp | Qwen3.8-Flash-Next UD-IQ4_XS | 131K, 262K | MoE expert cache in VRAM, prompt cache, persisted stable prefix |
 | vLLM | Qwen3.8-27B W4A16 (dense) | 80K, 131K, 190K | Highest decode speed, MTP drafting, prefix cache |
 | Strata | Qwen3.8-Flash-Next GSQ-RCO IQ3_S, abliterated GSQ-RCO IQ3_S, UD-IQ4_XS | 131K, 262K | Fastest prefill, flat decode up to 184K tokens, experts in pinned RAM with a ranked VRAM cache |
-| Maya | GLM-5.3-Flash Maya-S24 and Maya-M-Derisked, DeepSeek-V4.1-Flash Maya-S | 131K, 262K | GLM-5.3-Flash and DeepSeek-V4.1-Flash on one GPU; DeepSeek's experts beyond RAM read from NVMe |
+| Maya | GLM-5.3-Flash Maya-S24 and Maya-M-Derisked, DeepSeek-V4.1-Flash Maya-S, MiniMax-M3.1-Flash Maya-XS | 131K, 262K | GLM-5.3-Flash, DeepSeek-V4.1-Flash and MiniMax-M3.1-Flash on one GPU; DeepSeek's experts beyond RAM read from NVMe |
 
 **Dashboard.** Chat with images and web search, context profile, engine and
 model selection with restart, inference defaults, a live engine log, hardware
@@ -71,7 +71,8 @@ harness failures are left out.
 | vLLM | Qwen3.8-27B W4A16 AutoRound | 15 GB | 1,450-3,800 ⁴ | | 62-157 ⁴ | | 73-82 tok/s, 5.2-7.8 h |
 | Maya | GLM-5.3-Flash Maya-S24 | 95 GB | 1,196 | 1,296 | 23-27 | 22-26 | 20 tok/s, 16.8 h |
 | Maya | GLM-5.3-Flash Maya-M-Derisked | 116 GB | 1,043 | 1,199 | 17-21 | 17-20 | |
-| Maya | DeepSeek-V4.1-Flash Maya-S | 340 GB | 352 | 555 | 8-12 | 10-14 | 11 tok/s ⁵ |
+| Maya | DeepSeek-V4.1-Flash Maya-S | 340 GB | 352 | 555 | 8-12 | 10-14 | 11 tok/s, 14.4 h |
+| Maya | MiniMax-M3.1-Flash Maya-XS | 93 GB | 207 | 210 | 16-17 | 14-17 | |
 
 1. Not benchmarked separately: replies of 500 tokens or more in agent use,
    10th to 90th percentile (median 115).
@@ -81,7 +82,6 @@ harness failures are left out.
 4. Low end with the fp8 KV cache of the 131K and 190K profiles, high end with
    the bf16 KV cache of the 80K profile. tg by task type: JSON and German
    lowest, code highest.
-5. Run in progress (50 of 70 tasks after 10.8 h).
 
 Long context: Strata reads a 184K-token prompt at 3,755-3,922 tok/s and decodes
 as fast as at 6K. Maya-S24 decodes 22-26 tok/s at 181K. llama.cpp reads the
@@ -95,7 +95,7 @@ full 262K window at 177 tok/s and decodes 7 tok/s at that depth.
 - **PCIe 4.x or newer NVMe SSD as the system drive**, with about **410 GB free** for
   the default installation (weights 95 GB, engine container 61 GB, MTP draft 8 GB,
   vLLM stack and weights 40 GB, llama.cpp 3 GB, CUDA 13 toolkit 4 GB, Strata and its
-  two IQ3_S models 180 GB), plus about 560 GB for the optional Maya backend. Keep
+  two IQ3_S models 180 GB), plus about 660 GB for the optional Maya backend. Keep
   the data directory on NVMe.
 - **CUDA Toolkit 12.4 or newer**, including `nvcc`, CUDA runtime and cuBLAS.
 - Internet access and sudo rights for installation. Model weights are downloaded
@@ -153,10 +153,11 @@ except Maya:
    picks a subset.
 7. **Maya backend** (`engine/c/install_maya.sh`, only with `--with-maya`):
    [Project Maya](https://github.com/mw00/project-maya), Strata's fork for
-   GLM-5.3-Flash and DeepSeek-V4.1-Flash, built from source at a pinned revision, with
-   its own setup per model (download with sha256 checks, pack, vision encoder):
-   GLM-5.3-Flash Maya-S24 and Maya-M-Derisked, DeepSeek-V4.1-Flash Maya-S (about
-   560 GB together). `AI_DER_MAYA_MODELS=glm-s24,glm-m-derisked,ds4-s` picks a subset.
+   GLM-5.3-Flash, DeepSeek-V4.1-Flash and MiniMax-M3.1-Flash, built from source at a
+   pinned revision, with its own setup per model (download with sha256 checks, pack,
+   vision encoder): GLM-5.3-Flash Maya-S24 and Maya-M-Derisked, DeepSeek-V4.1-Flash
+   Maya-S and MiniMax-M3.1-Flash Maya-XS (about 660 GB together).
+   `AI_DER_MAYA_MODELS=glm-s24,glm-m-derisked,ds4-s,minimax-xs` picks a subset.
 8. **`ai-der.env`** in the checkout: the serving environment for all installed
    backends. `--systemd` also writes `~/.config/systemd/user/ai-der.service`.
 
@@ -252,6 +253,7 @@ vLLM stack, [Strata](https://github.com/Niko1221/Strata) (MIT) and
 [Project Maya](https://github.com/mw00/project-maya) (MIT). GGUF and quantization
 formats build on llama.cpp/ggml (MIT). Model weights come from their authors
 under their own licenses: Qwen (Qwen3.8), Unsloth (UD-IQ4_XS), ISTA-DASLab
-(GSQ-RCO IQ3_S), DavidAU (abliterated IQ3_S), Z.ai (GLM-5.3-Flash) and DeepSeek
-(DeepSeek-V4.1-Flash), quantized for Maya by its authors. Original copyright and
-license notices are retained.
+(GSQ-RCO IQ3_S), DavidAU (abliterated IQ3_S), Z.ai (GLM-5.3-Flash), DeepSeek
+(DeepSeek-V4.1-Flash) and MiniMax (MiniMax-M3.1-Flash, MiniMax Community License:
+non-commercial use free, commercial use with conditions), quantized for Maya by its
+authors. Original copyright and license notices are retained.

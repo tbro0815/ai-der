@@ -81,12 +81,13 @@ else echo "# Strata backend not installed (engine/c/install_strata.sh)"; fi
 maya_variants=""
 for entry in "glm-s24=maya-maya-s24.json|GLM-5.3-Flash Maya-S24" \
              "glm-m-derisked=maya-maya-m-derisked.json|GLM-5.3-Flash Maya-M-Derisked" \
-             "ds4-s=maya-ds4.json|DeepSeek-V4.1-Flash Maya-S"; do
+             "ds4-s=maya-ds4.json|DeepSeek-V4.1-Flash Maya-S" \
+             "minimax-xs=maya-minimax-maya-xs.json|MiniMax-M3.1-Flash Maya-XS"; do
     id=${entry%%=*}; rest=${entry#*=}; file=${rest%%|*}; label=${rest#*|}
     if [[ -f $maya_dir/$file ]]; then maya_variants+="${maya_variants:+;}$id=$maya_dir/$file|$label"; fi
 done
 if [[ -x $maya_dir/.venv/bin/python && -n $maya_variants ]]; then cat <<EOF
-# ---- Maya backend (GLM-5.3-Flash, DeepSeek-V4.1-Flash; models: id=maya-<model>.json|label) ----
+# ---- Maya backend (GLM-5.3-Flash, DeepSeek-V4.1-Flash, MiniMax-M3.1-Flash; models: id=maya-<model>.json|label) ----
 COLI_MAYA_CMD="$maya_dir/.venv/bin/python $maya_dir/serve/server.py --engine strata"
 COLI_MAYA_PORT=8085
 COLI_MAYA_DIR=$maya_dir

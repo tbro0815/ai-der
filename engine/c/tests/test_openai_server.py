@@ -3984,11 +3984,17 @@ class ProxyEngineTest(unittest.TestCase):
         Path(tmp, "maya-ds4.json").write_text(json.dumps(ds4))
         ds4["args"] = ds4["args"][:-2]                    # the tower in the pack
         Path(tmp, "maya-ds4-vision.json").write_text(json.dumps(ds4))
+        minimax = {"exe": "/srv/maya/build/maya-mm3", "cwd": "/srv/maya",
+                   "args": ["--pack", "/m/maya-mm3", "--max-context", "131072", "--kv-streaming", "on",
+                            "--vision", "on", "--dspark", "on"],
+                   "model_name": "minimax-m3.1-flash", "port": 8085}
+        Path(tmp, "maya-minimax-maya-xs.json").write_text(json.dumps(minimax))
         return {"COLI_MAYA_CMD": "/srv/maya/.venv/bin/python /srv/maya/serve/server.py --engine strata",
                 "COLI_MAYA_PORT": str(self.upstream.server_address[1]), "COLI_MAYA_RUNTIME": tmp,
                 "COLI_MAYA_VARIANTS": f"glm-s24={tmp}/maya-s24.json|GLM-5.3-Flash Maya-S24; "
                                       f"ds4-s={tmp}/maya-ds4.json|DeepSeek-V4.1-Flash Maya-S|max=131072; "
-                                      f"ds4-v={tmp}/maya-ds4-vision.json|DeepSeek-V4.1-Flash Maya-S, images"}
+                                      f"ds4-v={tmp}/maya-ds4-vision.json|DeepSeek-V4.1-Flash Maya-S, images; "
+                                      f"minimax-xs={tmp}/maya-minimax-maya-xs.json|MiniMax-M3.1-Flash Maya-XS"}
 
     def test_maya_starts_from_its_setup_config(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4004,8 +4010,12 @@ class ProxyEngineTest(unittest.TestCase):
                                    env=dict(env, COLI_CONTEXT_PROFILE="fast"), spawn=False)
                 ds4v = ProxyEngine("maya", "aider-omni-flash",
                                    env=dict(env, COLI_MAYA_VARIANT="ds4-v"), spawn=False)
+                minimax = ProxyEngine("maya", "aider-omni-flash",
+                                      env=dict(env, COLI_CONTEXT_PROFILE="long", COLI_MAYA_VARIANT="minimax-xs"),
+                                      spawn=False)
             for engine, variant, window, images in ((glm, "glm-s24", 262144, True), (ds4, "ds4-s", 131072, False),
-                                                    (fast, "glm-s24", 131072, True), (ds4v, "ds4-v", 131072, True)):
+                                                    (fast, "glm-s24", 131072, True), (ds4v, "ds4-v", 131072, True),
+                                                    (minimax, "minimax-xs", 262144, True)):
                 self.assertEqual((engine.backend["variant"], engine.context_window, engine.images),
                                  (variant, window, images))
                 derived = engine.command[engine.command.index("--config") + 1]
@@ -4019,6 +4029,7 @@ class ProxyEngineTest(unittest.TestCase):
                 self.assertEqual(engine.backend["label"], "Maya")
                 engine.close()
             self.assertEqual(ds4.upstream_model, "deepseek-v4.1-flash")
+            self.assertEqual(minimax.upstream_model, "minimax-m3.1-flash")
             self.assertEqual(fast.backend["profile"], "standard")       # fast is vLLM-only
             self.assertFalse(glm._health_ready(b'{"status": "ok", "max_context": 0}'))
             self.assertTrue(glm._health_ready(b'{"status": "ok", "max_context": 262144}'))

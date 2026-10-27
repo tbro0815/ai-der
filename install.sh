@@ -2,7 +2,7 @@
 # AI-DER: install in this checkout on an Ubuntu/CUDA workstation.
 # Default: engine + dashboard, the model weights (downloaded and converted, MTP draft
 # prepared), the llama.cpp, vLLM and Strata backends, and ai-der.env for serving; the Maya
-# backend (GLM-5.3-Flash, DeepSeek-V4.1-Flash) on request (--with-maya).
+# backend (GLM-5.3-Flash, DeepSeek-V4.1-Flash, MiniMax-M3.1-Flash) on request (--with-maya).
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 fail() { echo "AI-DER: $*" >&2; exit 1; }
@@ -19,8 +19,8 @@ Usage: ./install.sh [--check] [--no-apt] [--core-only] [--skip-models] [--skip-l
   --skip-strata    do not install the Strata backend and its models (~180 GB of downloads;
                    AI_DER_STRATA_MODELS=gsq,uncensored,ud picks a subset)
   --with-maya      also install the Maya backend and its models (GLM-5.3-Flash Maya-S24 96 GB,
-                   Maya-M-Derisked 117 GB, DeepSeek-V4.1-Flash Maya-S 348 GB;
-                   AI_DER_MAYA_MODELS=glm-s24,glm-m-derisked,ds4-s picks a subset)
+                   Maya-M-Derisked 117 GB, DeepSeek-V4.1-Flash Maya-S 348 GB, MiniMax-M3.1-Flash
+                   Maya-XS 97 GB; AI_DER_MAYA_MODELS=glm-s24,glm-m-derisked,ds4-s,minimax-xs picks a subset)
   --systemd        also write a user unit (~/.config/systemd/user/ai-der.service)
   --data-dir DIR   weights, container and backends go here (default ~/ai-der-data, ~410 GB)
 Targets Ubuntu 24.04/26.04 x86_64, CUDA 12.4+, RTX 3090/3090 Ti, 128 GB RAM.
@@ -72,10 +72,11 @@ echo "GPU: $gpus; CUDA: $cuda_version"
 # Maya per model (with its vision files and pack)
 maya_gb=0
 if (( maya )); then
-    want=${AI_DER_MAYA_MODELS:-glm-s24,glm-m-derisked,ds4-s}
+    want=${AI_DER_MAYA_MODELS:-glm-s24,glm-m-derisked,ds4-s,minimax-xs}
     [[ ,$want, == *,glm-s24,* ]] && maya_gb=$(( maya_gb + 96 ))
     [[ ,$want, == *,glm-m-derisked,* ]] && maya_gb=$(( maya_gb + 117 ))
     [[ ,$want, == *,ds4-s,* ]] && maya_gb=$(( maya_gb + 350 ))
+    [[ ,$want, == *,minimax-xs,* ]] && maya_gb=$(( maya_gb + 97 ))
 fi
 need_gb=$(( models * 170 + vllm * 40 + llamacpp * 3 + strata * 180 + (llamacpp | strata | maya) * 4 + maya_gb + 5 ))
 probe=$data; while [[ ! -d $probe ]]; do probe=$(dirname "$probe"); done

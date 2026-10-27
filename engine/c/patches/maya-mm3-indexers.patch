@@ -1,0 +1,14 @@
+diff --git a/maya.py b/maya.py
+index af1c41d..34ae6e5 100755
+--- a/maya.py
++++ b/maya.py
+@@ -4784,7 +4784,8 @@ def mm3_pack_step(a, d: Path, files: list, gguf: bool = False, companions: Path
+     if gguf:
+         run([sys.executable, str(ROOT / "tools" / "mm3" / "pack_gguf.py"), "--model", str(d), "--out", str(pack)] +
+             (["--companions", str(companions)] if companions else ["--text-only"]) +
+-            ["--shards"] + [f.name for f in shards])
++            ["--shards"] + [f.name for f in shards] +
++            [x for f in files if f.name.endswith("-maya-indexers.bin") for x in ("--indexers", str(d / f.name))])
+     else:
+         run([sys.executable, str(ROOT / "tools" / "mm3" / "pack.py"), "--model", str(d), "--out", str(pack)])
+     missing = [f for f in need if not (pack / f).exists()]
